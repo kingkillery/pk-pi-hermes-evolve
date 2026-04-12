@@ -1,0 +1,7 @@
+node_modules/
+.pi/
+*.log
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/

@@ -1,0 +1,63 @@
+name: Release
+
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+          cache: npm
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Validate package
+        run: |
+          npm run typecheck
+          npm run python:check
+          npm pack --dry-run
+
+      - name: Check published version
+        id: version
+        shell: bash
+        run: |
+          LOCAL_VERSION=$(node -p "require('./package.json').version")
+          REMOTE_VERSION=$(npm view pk-pi-hermes-evolve version 2>/dev/null || true)
+          echo "local=$LOCAL_VERSION" >> "$GITHUB_OUTPUT"
+          echo "remote=$REMOTE_VERSION" >> "$GITHUB_OUTPUT"
+          if [ "$LOCAL_VERSION" = "$REMOTE_VERSION" ]; then
+            echo "already_published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "already_published=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish to npm
+        if: steps.version.outputs.already_published != 'true'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public
+
+      - name: Publish summary
+        run: |
+          echo "Local version: ${{ steps.version.outputs.local }}"
+          echo "Remote version before publish: ${{ steps.version.outputs.remote }}"
+          echo "Already published: ${{ steps.version.outputs.already_published }}"

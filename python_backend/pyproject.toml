@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pk-pi-hermes-evolve-backend"
+version = "0.1.0"
+description = "Optional Python DSPy/GEPA backend for pk-pi-hermes-evolve"
+requires-python = ">=3.10"
+dependencies = [
+  "dspy>=3.0.0"
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["pk_pi_hermes_evolve*"]
