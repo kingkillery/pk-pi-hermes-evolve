@@ -1,6 +1,6 @@
 {
   "name": "pk-pi-hermes-evolve",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Pi package inspired by Hermes Agent Self-Evolution for reflective improvement of skills, prompts, and instruction files.",
   "license": "MIT",
   "type": "module",

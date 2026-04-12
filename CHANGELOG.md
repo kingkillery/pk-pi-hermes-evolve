@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.1 - 2026-04-12
+
+- fix Python backend syntax so CI and `python:check` pass cleanly
+- republish hybrid extension package with the corrected Python backend
+
 ## 0.2.0 - 2026-04-12
 
 - add optional Python DSPy/GEPA hybrid backend under `python_backend/`

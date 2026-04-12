@@ -625,8 +625,9 @@ def _report_markdown(result: dict[str, Any]) -> str:
     ]
     for candidate in candidates:
         aggregate = candidate["aggregate"]
+        rationale = str(candidate["rationale"]).replace("|", "\\|")
         candidate_lines.append(
-            f"| {candidate['name']} | {aggregate['composite']:.3f} | {aggregate['correctness']:.3f} | {aggregate['procedure_following']:.3f} | {aggregate['conciseness']:.3f} | {candidate['rationale'].replace('|', '\\|')} |"
+            f"| {candidate['name']} | {aggregate['composite']:.3f} | {aggregate['correctness']:.3f} | {aggregate['procedure_following']:.3f} | {aggregate['conciseness']:.3f} | {rationale} |"
         )
     snippets = result.get("session_snippets", [])
     snippet_text = (
