@@ -6,6 +6,8 @@
 - add `scripts/tasks/hermes_parity_task.json` as the default parity task spec
 - upgrade the Ralph judge with deterministic repo-deliverable checks for parity targets like execution traces, validation splits, and golden datasets
 - include OpenTelemetry Python dependencies and repo scripts for the Ralph loop workflow
+- add `scripts/sokoban_benchmark.py` plus bundled benchmark assets under `benchmarks/sokoban/`
+- add a scaffolded baseline-vs-improvement 5-attempt benchmark workflow with attempt preparation, CSV recording, and summary analysis
 
 ## 0.2.1 - 2026-04-12
 

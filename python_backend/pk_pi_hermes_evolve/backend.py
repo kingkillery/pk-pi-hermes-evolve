@@ -1143,7 +1143,8 @@ def run_backend(payload: dict[str, Any]) -> dict[str, Any]:
             {
                 "rationale": candidate.rationale,
                 "warnings": candidate.warnings,
-                "aggregate": asdict(candidate.aggregate),
+                "validationAggregate": asdict(candidate.aggregate),
+                "holdoutAggregate": asdict(candidate.holdout_aggregate) if candidate.holdout_aggregate else None,
                 "constraints": [{"name": c.name, "passed": c.passed, "message": c.message} for c in candidate.constraints],
                 "semanticDriftScore": candidate.semantic_drift_score,
                 "testPassed": candidate.test_passed,
@@ -1155,7 +1156,8 @@ def run_backend(payload: dict[str, Any]) -> dict[str, Any]:
                 "name": candidate.name,
                 "rationale": candidate.rationale,
                 "warnings": candidate.warnings,
-                "aggregate": asdict(candidate.aggregate),
+                "validationScore": asdict(candidate.aggregate),
+                "holdoutScore": asdict(candidate.holdout_aggregate) if candidate.holdout_aggregate else None,
                 "semanticDriftScore": candidate.semantic_drift_score,
                 "testPassed": candidate.test_passed,
                 "constraintsPassed": all(c.passed for c in candidate.constraints),
@@ -1173,13 +1175,17 @@ def run_backend(payload: dict[str, Any]) -> dict[str, Any]:
         "objective": objective,
         "evalSource": eval_source,
         "modelLabel": model,
+        "selectionSplit": "validation",
+        "confirmationSplit": "holdout",
         "trainExamples": len(train_examples),
         "validationExamples": len(validation_examples),
         "holdoutExamples": len(holdout_examples),
         "goldenTaskId": golden_task_id,
         "candidateCount": len(candidates),
+        "baselineValidationScore": baseline_validation_aggregate.composite,
+        "bestValidationScore": best.aggregate.composite,
         "baselineHoldoutScore": baseline_holdout_aggregate.composite,
-        "bestHoldoutScore": best.aggregate.composite,
+        "bestHoldoutScore": best_holdout_aggregate.composite,
         "improvement": improvement,
         "bestCandidateName": best.name,
         "target_type": target["type"],
@@ -1191,7 +1197,15 @@ def run_backend(payload: dict[str, Any]) -> dict[str, Any]:
     _write_json(manifest_path, {**summary, "candidates": candidate_payloads})
 
     # Minimal report (Python side — full report is in TS backend)
-    _write_text(report_path, f"# Hermes-style Self-Evolution Report (Python backend)\n\nSee manifest.json for full metrics.\n")
+    _write_text(
+        report_path,
+        (
+            "# Hermes-style Self-Evolution Report (Python backend)\n\n"
+            f"- Selection (validation): {baseline_validation_aggregate.composite:.3f} → {best.aggregate.composite:.3f}\n"
+            f"- Confirmation (holdout): {baseline_holdout_aggregate.composite:.3f} → {best_holdout_aggregate.composite:.3f}\n\n"
+            "See manifest.json for full metrics.\n"
+        ),
+    )
 
     return summary
 

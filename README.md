@@ -216,10 +216,10 @@ What the latest parity upgrade adds:
 - **golden dataset support**: when a `goldenTaskId` is provided, the validation split is tagged as a golden set for reproducible cross-run evaluation
 - **traced Ralph loop** (`scripts/ralph_otel.py`) with OpenTelemetry spans for `ralph.run/<task>`, `loop.step`, `model.infer`, `tool`, and `judge`
 - **deterministic repo-deliverable checks** in the judge (execution traces, validation split, golden datasets)
+- a **Sokoban benchmark scaffold** (`scripts/sokoban_benchmark.py`) for initializing repeatable 5-attempt baseline/improvement runs, preparing per-attempt artifacts, recording results, and summarizing held-out performance
 
 What is still missing versus the full Nous vision:
 
-- no benchmark runner integration yet
 - no automatic pytest / external benchmark gate yet
 - no code-organism evolution
 - still optimized mainly for prompt/instruction artifacts, not general source code
@@ -236,6 +236,50 @@ npm install
 npm run typecheck
 npm run python:check
 ```
+
+## Sokoban benchmark scaffold
+
+The repo now includes a reusable benchmark scaffold built around the provided Sokoban benchmark pack and CSV schema:
+
+- benchmark assets live under `benchmarks/sokoban/`
+- runner entrypoint: `scripts/sokoban_benchmark.py`
+- supported workflow:
+  - initialize a run
+  - prepare a baseline or improvement attempt
+  - record a completed attempt into `results.csv`
+  - analyze attempt-1 vs attempt-5 and baseline-vs-improvement attempt-5 deltas
+
+Example:
+
+```bash
+python scripts/sokoban_benchmark.py init \
+  --run-id demo-sokoban \
+  --training-levels level-a level-b level-c level-d \
+  --heldout-level level-e
+
+python scripts/sokoban_benchmark.py prepare-attempt \
+  --run-id demo-sokoban \
+  --arm improvement \
+  --attempt 1
+
+python scripts/sokoban_benchmark.py record-attempt \
+  --run-id demo-sokoban \
+  --arm improvement \
+  --attempt 1
+
+python scripts/sokoban_benchmark.py analyze \
+  --run-id demo-sokoban
+```
+
+`prepare-attempt` creates:
+
+- `prompt.md`
+- `result.json`
+- `postmortem.md`
+- `input-skill.md`
+- `updated-skill.md`
+
+`record-attempt` validates the result payload against the CSV schema and carries the updated skill forward for the improvement arm.
 
 ## Ralph loop for Hermes parity work
 
@@ -263,11 +307,10 @@ Use `--telemetry-export otlp-http --otlp-endpoint http://host:4318` to ship trac
 
 ## Next useful upgrades
 
-- add optional validation hooks (`testCommand`) before recommending a candidate
 - add real execution-based evaluation via subagent runs
 - add prompt-template / skill-specific rubric presets
 - add diff rendering in the final report
 - add apply/approve workflows behind explicit confirmation
+- add automatic browser/game automation for benchmark runs instead of scaffold-only preparation
 - add benchmark/test gates to the Python backend so GEPA mutations are filtered by real task outcomes
-- use validation split for intermediate candidate selection (currently candidates are scored on holdout only)
-- add persistent golden dataset files that survive across runs for consistent benchmarking
+- add repeated multi-run aggregation across several held-out boards instead of single-run summaries

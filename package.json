@@ -20,6 +20,7 @@
   },
   "files": [
     "src",
+    "benchmarks",
     "scripts",
     "python_backend",
     "README.md",
@@ -42,8 +43,9 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "python:check": "python -m py_compile python_backend/run_backend.py python_backend/pk_pi_hermes_evolve/backend.py scripts/ralph_otel.py",
-    "ralph:parity": "python scripts/ralph_otel.py --task-file scripts/tasks/hermes_parity_task.json --repo . --telemetry-export console"
+    "python:check": "python -m py_compile python_backend/run_backend.py python_backend/pk_pi_hermes_evolve/backend.py scripts/ralph_otel.py scripts/sokoban_benchmark.py",
+    "ralph:parity": "python scripts/ralph_otel.py --task-file scripts/tasks/hermes_parity_task.json --repo . --telemetry-export console",
+    "benchmark:sokoban:help": "python scripts/sokoban_benchmark.py --help"
   },
   "publishConfig": {
     "access": "public"
