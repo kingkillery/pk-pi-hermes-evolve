@@ -23,6 +23,11 @@ const ToolParams = Type.Object({
   maxExamples: Type.Optional(Type.Number({ description: "How many evaluation examples to generate (default 8, max 12)" })),
   sessionQuery: Type.Optional(Type.String({ description: "Optional hint phrase for mining relevant pi session history" })),
   model: Type.Optional(Type.String({ description: "Optional model override, e.g. anthropic/claude-sonnet-4-5" })),
+  goldenTaskId: Type.Optional(Type.String({ description: "Optional golden task identifier for reproducible validation split evaluation" })),
+  testCommand: Type.Optional(Type.String({ description: "Shell command to run as a validation gate before accepting candidates (e.g. 'npm test')" })),
+  testTimeout: Type.Optional(Type.Number({ description: "Timeout in seconds for the test command (default 60)" })),
+  createPR: Type.Optional(Type.Boolean({ description: "Create a git branch and optionally PR with the best candidate (default false)" })),
+  persistGolden: Type.Optional(Type.Boolean({ description: "Persist golden dataset for reuse across runs (default true when goldenTaskId is set)" })),
 });
 
 type ToolInput = Static<typeof ToolParams>;
@@ -138,6 +143,12 @@ function getLastRun(ctx: ExtensionContext): LastRunData | null {
 
 function buildSummaryMarkdown(details: EvolutionSummaryDetails): string {
   const sign = details.improvement >= 0 ? "+" : "";
+  const goldenLine = details.goldenTaskId ? `\n- **Golden task:** ${details.goldenTaskId}` : "";
+  const testLine = details.testGatePassed !== undefined ? `\n- **Test gate:** ${details.testGatePassed ? "passed ✅" : "failed ❌"}` : "";
+  const driftLine = details.semanticDriftScore !== undefined ? `\n- **Semantic drift:** ${details.semanticDriftScore.toFixed(3)}` : "";
+  const prLine = details.prBranch ? `\n- **PR branch:** ${details.prBranch}` : "";
+  const tracesLine = `\n- **Traces captured:** ${details.tracesCaptured}`;
+  const constraintsLine = `\n- **Constraints:** ${details.constraintsPassed ? "all passed ✅" : "some failed ❌"}`;
   return [
     "## Hermes-style self-evolution finished",
     "",
@@ -145,10 +156,18 @@ function buildSummaryMarkdown(details: EvolutionSummaryDetails): string {
     `- **Objective:** ${details.objective}`,
     `- **Eval source:** ${details.evalSource}`,
     `- **Model:** ${details.modelLabel}`,
+    `- **Splits:** ${details.trainExamples} train / ${details.validationExamples} validation / ${details.holdoutExamples} holdout`,
     `- **Backend:** ${details.backend ?? "typescript"}${details.optimizerUsed ? ` (${details.optimizerUsed})` : ""}`,
-    `- **Holdout score:** ${details.baselineHoldoutScore.toFixed(3)} → ${details.bestHoldoutScore.toFixed(3)} (${sign}${details.improvement.toFixed(3)})`,
+    `- **Selection (${details.selectionSplit}):** ${details.baselineValidationScore.toFixed(3)} → ${details.bestValidationScore.toFixed(3)}`,
+    `- **Confirmation (${details.confirmationSplit}):** ${details.baselineHoldoutScore.toFixed(3)} → ${details.bestHoldoutScore.toFixed(3)} (${sign}${details.improvement.toFixed(3)})`,
     `- **Best candidate:** ${details.bestCandidateName}`,
     `- **Report:** ${details.reportPath}`,
+    goldenLine,
+    testLine,
+    driftLine,
+    prLine,
+    tracesLine,
+    constraintsLine,
   ].join("\n");
 }
 
@@ -240,6 +259,11 @@ async function executeEvolution(
     maxExamples,
     sessionQuery: input.sessionQuery,
     backend: input.backend,
+    goldenTaskId: input.goldenTaskId,
+    testCommand: input.testCommand,
+    testTimeout: input.testTimeout,
+    createPR: input.createPR,
+    persistGolden: input.persistGolden,
     signal: ctx.signal,
     onProgress: (phase, detail) => {
       updateStatus(ctx, phase, detail);
@@ -294,6 +318,8 @@ export default function hermesSelfEvolutionExtension(pi: ExtensionAPI): void {
       "Use this tool when the user explicitly asks to improve or evolve a local pi skill, prompt, AGENTS.md, or SYSTEM.md file.",
       "Do not use this tool for arbitrary source code refactors; it is optimized for text instructions and prompts.",
       "Tell the user where the report and candidate files were written so they can review before applying changes.",
+      "Optionally specify testCommand to run a validation gate (e.g. 'npm run typecheck') before accepting candidates.",
+      "Optionally set createPR to true to auto-create a git branch with the best candidate.",
     ],
     parameters: ToolParams,
     async execute(_toolCallId, params: ToolInput, _signal, onUpdate, ctx) {
@@ -301,15 +327,22 @@ export default function hermesSelfEvolutionExtension(pi: ExtensionAPI): void {
         updateStatus(ctx, "start", "Preparing run");
         const details = await executeEvolution(pi, params, ctx, onUpdate);
         const sign = details.improvement >= 0 ? "+" : "";
+        const tracesNote = details.tracesCaptured > 0 ? `\nTraces: ${details.tracesCaptured}` : "";
         return {
           content: [{
             type: "text",
             text: [
               `Self-evolution completed for ${details.targetPath}`,
               `Best candidate: ${details.bestCandidateName}`,
-              `Holdout score: ${details.baselineHoldoutScore.toFixed(3)} → ${details.bestHoldoutScore.toFixed(3)} (${sign}${details.improvement.toFixed(3)})`,
+              `Selection (${details.selectionSplit}): ${details.baselineValidationScore.toFixed(3)} → ${details.bestValidationScore.toFixed(3)}`,
+              `Confirmation (${details.confirmationSplit}): ${details.baselineHoldoutScore.toFixed(3)} → ${details.bestHoldoutScore.toFixed(3)} (${sign}${details.improvement.toFixed(3)})`,
+              details.constraintsPassed ? "Constraints: all passed ✅" : "Constraints: some failed ❌",
+              details.testGatePassed !== undefined ? `Test gate: ${details.testGatePassed ? "passed" : "failed"}` : "",
+              details.semanticDriftScore !== undefined ? `Drift: ${details.semanticDriftScore.toFixed(3)}` : "",
+              details.prBranch ? `PR branch: ${details.prBranch}` : "",
               `Report: ${details.reportPath}`,
-            ].join("\n"),
+              tracesNote,
+            ].filter(Boolean).join("\n"),
           }],
           details,
         };
@@ -321,7 +354,9 @@ export default function hermesSelfEvolutionExtension(pi: ExtensionAPI): void {
       const label = theme.fg("toolTitle", theme.bold("self_evolve_artifact "));
       const target = theme.fg("accent", String(args.targetPath ?? "<missing>"));
       const source = args.evalSource ? theme.fg("muted", ` ${String(args.evalSource)}`) : "";
-      return new Text(`${label}${target}${source}`, 0, 0);
+      const test = args.testCommand ? theme.fg("muted", ` test="${String(args.testCommand)}"`) : "";
+      const pr = args.createPR ? theme.fg("muted", " pr") : "";
+      return new Text(`${label}${target}${source}${test}${pr}`, 0, 0);
     },
     renderResult(result, { expanded }, theme) {
       const details = result.details as EvolutionSummaryDetails | undefined;
@@ -337,12 +372,34 @@ export default function hermesSelfEvolutionExtension(pi: ExtensionAPI): void {
       ];
 
       if (expanded) {
-        const baseline = typeof details.baselineHoldoutScore === "number" ? details.baselineHoldoutScore.toFixed(3) : "?";
-        const best = typeof details.bestHoldoutScore === "number" ? details.bestHoldoutScore.toFixed(3) : "?";
+        const baselineValidation = typeof details.baselineValidationScore === "number" ? details.baselineValidationScore.toFixed(3) : "?";
+        const bestValidation = typeof details.bestValidationScore === "number" ? details.bestValidationScore.toFixed(3) : "?";
+        const baselineHoldout = typeof details.baselineHoldoutScore === "number" ? details.baselineHoldoutScore.toFixed(3) : "?";
+        const bestHoldout = typeof details.bestHoldoutScore === "number" ? details.bestHoldoutScore.toFixed(3) : "?";
         const improvement = typeof details.improvement === "number" ? `${details.improvement >= 0 ? "+" : ""}${details.improvement.toFixed(3)}` : "?";
-        lines.push(`${theme.fg("muted", "holdout:")} ${baseline} → ${best} (${improvement})`);
+        lines.push(`${theme.fg("muted", "splits:")} ${details.trainExamples}/${details.validationExamples}/${details.holdoutExamples} (train/val/holdout)`);
+        lines.push(`${theme.fg("muted", "selection:")} ${details.selectionSplit} ${baselineValidation} → ${bestValidation}`);
+        lines.push(`${theme.fg("muted", "confirmation:")} ${details.confirmationSplit} ${baselineHoldout} → ${bestHoldout} (${improvement})`);
         lines.push(`${theme.fg("muted", "best candidate:")} ${String(details.bestCandidateName ?? "")}`);
         lines.push(`${theme.fg("muted", "backend:")} ${String(details.backend ?? "typescript")}${details.optimizerUsed ? ` (${details.optimizerUsed})` : ""}`);
+        if (details.goldenTaskId) {
+          lines.push(`${theme.fg("muted", "golden:")} ${details.goldenTaskId}`);
+        }
+        if (details.tracesCaptured > 0) {
+          lines.push(`${theme.fg("muted", "traces:")} ${details.tracesCaptured}`);
+        }
+        if (details.constraintsPassed !== undefined) {
+          lines.push(`${theme.fg("muted", "constraints:")} ${details.constraintsPassed ? "✅ all pass" : "❌ some fail"}`);
+        }
+        if (details.testGatePassed !== undefined) {
+          lines.push(`${theme.fg("muted", "test gate:")} ${details.testGatePassed ? "✅ passed" : "❌ failed"}`);
+        }
+        if (details.semanticDriftScore !== undefined) {
+          lines.push(`${theme.fg("muted", "drift:")} ${details.semanticDriftScore.toFixed(3)}`);
+        }
+        if (details.prBranch) {
+          lines.push(`${theme.fg("muted", "PR:")} ${details.prBranch}`);
+        }
       }
 
       return new Text(lines.join("\n"), 0, 0);

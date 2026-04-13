@@ -1,0 +1,92 @@
+{
+  "task_id": "hermes-pi-parity-gap-closure",
+  "title": "Close the highest-value Hermes parity gaps in pk-pi-hermes-evolve",
+  "objective": "Move pk-pi-hermes-evolve from a good-faith Hermes-inspired adaptation toward a stronger pi-native Hermes Phase 1 analogue. Prioritize execution-based evaluation, structured traces, richer dataset splits, and validation hooks without abandoning the current review-first safety model.",
+  "acceptable_end_state": "The repository contains a traced, retryable Ralph loop that can drive this parity work; the loop writes JSON step artifacts and OpenTelemetry spans, runs real repo validation commands after each step, and can judge whether more work is needed. The package also remains typecheck-clean and Python-syntax-clean after the loop's edits.",
+  "deliverables": [
+    "A runnable scripts/ralph_otel.py orchestration loop tailored to this repository",
+    "A task spec that captures the Hermes parity objective for the loop",
+    "Python backend dependency metadata for OpenTelemetry exporters",
+    "README documentation for running the Ralph loop against this repo",
+    "Validation coverage in the loop for TypeScript typecheck and Python syntax checks"
+  ],
+  "validation_commands": [
+    "\"/c/Program Files/nodejs/node\" \"/c/Program Files/nodejs/node_modules/npm/bin/npm-cli.js\" run typecheck",
+    "python -m py_compile python_backend/run_backend.py python_backend/pk_pi_hermes_evolve/backend.py scripts/ralph_otel.py"
+  ],
+  "success_signals": [
+    "The Ralph loop emits a root span named ralph.run/<task>",
+    "Each loop iteration emits loop.step, model.infer, tool, and judge spans",
+    "Logs include correlated trace and span identifiers",
+    "Run artifacts are written under .pi/hermes-self-evolution/ralph-runs/",
+    "The loop can stop early when the judge passes or when the worker reports no more steps are needed"
+  ],
+  "out_of_scope": [
+    "Republishing the npm package during this implementation step",
+    "Implementing full Hermes benchmark parity in the same change",
+    "Autonomous direct writes to the target artifact without human review",
+    "General code-organism evolution"
+  ],
+  "repo_checks": [
+    {
+      "check_id": "execution-trace-summary",
+      "description": "The current Ralph run writes a summary artifact.",
+      "kind": "path_exists",
+      "base": "run",
+      "path": "summary.json"
+    },
+    {
+      "check_id": "execution-trace-step-artifacts",
+      "description": "The current Ralph run writes per-step JSON artifacts.",
+      "kind": "glob_min_matches",
+      "base": "run",
+      "glob": "steps/step-*.json",
+      "min_matches": 1
+    },
+    {
+      "check_id": "execution-trace-span-contract",
+      "description": "The Ralph loop code contains the expected traced span names.",
+      "kind": "file_contains_all",
+      "base": "repo",
+      "path": "scripts/ralph_otel.py",
+      "needles": ["ralph.run/", "loop.step", "model.infer", "judge"]
+    },
+    {
+      "check_id": "validation-split-typescript",
+      "description": "TypeScript orchestration exposes a validation split in addition to train and holdout.",
+      "kind": "glob_regex_all",
+      "base": "repo",
+      "glob": "src/**/*.ts",
+      "regexes": ["val(?:idation)?[A-Za-z_]*Examples"]
+    },
+    {
+      "check_id": "validation-split-python",
+      "description": "Python backend exposes a validation split in addition to train and holdout.",
+      "kind": "glob_regex_all",
+      "base": "repo",
+      "glob": "python_backend/**/*.py",
+      "regexes": ["val(?:idation)?_[A-Za-z_]*examples"]
+    },
+    {
+      "check_id": "golden-dataset-typescript",
+      "description": "TypeScript codebase mentions or implements golden dataset support.",
+      "kind": "glob_regex_all",
+      "base": "repo",
+      "glob": "src/**/*.ts",
+      "regexes": ["golden"]
+    },
+    {
+      "check_id": "golden-dataset-python",
+      "description": "Python backend mentions or implements golden dataset support.",
+      "kind": "glob_regex_all",
+      "base": "repo",
+      "glob": "python_backend/**/*.py",
+      "regexes": ["golden"]
+    }
+  ],
+  "repo_notes": [
+    "The project is a pi-native extension with a TypeScript orchestrator and optional Python backend under python_backend/.",
+    "Current known Hermes parity gaps include execution-based evaluation, trace capture, validation split support, golden datasets, and benchmark/test gates.",
+    "The Ralph loop should help close those gaps rather than replace the existing extension entrypoints."
+  ]
+}

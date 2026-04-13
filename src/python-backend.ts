@@ -21,24 +21,40 @@ export interface PythonBackendRunInput {
   candidateCount: number;
   maxExamples: number;
   sessionQuery?: string;
+  goldenTaskId?: string;
+  testCommand?: string;
+  testTimeout?: number;
+  createPR?: boolean;
+  persistGolden?: boolean;
 }
 
 export interface PythonBackendRunSummary {
   backend: "python";
-  optimizerUsed?: string;
+  optimizer_used?: string;
   runDir: string;
   reportPath: string;
   targetPath: string;
   objective: string;
   evalSource: string;
   modelLabel: string;
+  selectionSplit?: "validation";
+  confirmationSplit?: "holdout";
   trainExamples: number;
+  validationExamples: number;
   holdoutExamples: number;
+  goldenTaskId: string | null;
   candidateCount: number;
+  baselineValidationScore?: number;
+  bestValidationScore?: number;
   baselineHoldoutScore: number;
   bestHoldoutScore: number;
   improvement: number;
   bestCandidateName: string;
+  tracesCaptured?: number;
+  constraintsPassed?: boolean;
+  testGatePassed?: boolean;
+  semanticDriftScore?: number;
+  prBranch?: string;
   error?: string;
 }
 

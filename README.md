@@ -149,6 +149,12 @@ Example prompt to pi:
 Use self_evolve_artifact on .pi/skills/review/SKILL.md to improve trigger clarity and output quality.
 ```
 
+With a golden task ID for reproducible validation:
+
+```text
+Use self_evolve_artifact on .pi/skills/review/SKILL.md with goldenTaskId "review-skill-v1".
+```
+
 ## Output layout
 
 Every run writes to a timestamped directory:
@@ -165,6 +171,22 @@ Every run writes to a timestamped directory:
     ├── candidate-1.json
     └── ...
 ```
+
+### Dataset splits
+
+Generated examples are split into three sets:
+
+- **Train** (~50%): used for candidate generation and weakness analysis
+- **Validation** (~20%): used for intermediate scoring and golden dataset tagging
+- **Holdout** (~30%): used only for final evaluation, never during candidate generation
+
+### Golden datasets
+
+When `goldenTaskId` is provided (tool parameter or Ralph loop `--golden-task-id`), the validation split is tagged as a golden dataset. This enables:
+
+- reproducible cross-run evaluation with a known example set
+- consistent benchmarking across different candidate strategies
+- traceability from evolution runs back to the originating task
 
 ## Guardrails
 
@@ -188,6 +210,13 @@ What the Python upgrade adds:
 - a GEPA path when the installed DSPy build exposes `dspy.GEPA`
 - automatic fallback to MIPROv2 or plain Chain-of-Thought if GEPA is unavailable
 
+What the latest parity upgrade adds:
+
+- a **three-way dataset split** (train / validation / holdout) in both TypeScript and Python backends
+- **golden dataset support**: when a `goldenTaskId` is provided, the validation split is tagged as a golden set for reproducible cross-run evaluation
+- **traced Ralph loop** (`scripts/ralph_otel.py`) with OpenTelemetry spans for `ralph.run/<task>`, `loop.step`, `model.infer`, `tool`, and `judge`
+- **deterministic repo-deliverable checks** in the judge (execution traces, validation split, golden datasets)
+
 What is still missing versus the full Nous vision:
 
 - no benchmark runner integration yet
@@ -208,6 +237,30 @@ npm run typecheck
 npm run python:check
 ```
 
+## Ralph loop for Hermes parity work
+
+The repo now includes a traced Ralph loop for closing the highest-value Hermes parity gaps:
+
+```bash
+cd /c/dev/Desktop-Projects/pi-hermes-self-evolution
+python scripts/ralph_otel.py \
+  --task-file scripts/tasks/hermes_parity_task.json \
+  --repo . \
+  --model zai/glm-5.1 \
+  --telemetry-export console
+```
+
+What it does:
+
+- runs a retryable multi-step loop against this repo
+- calls `pi` as the execution worker for each step
+- runs validation commands after every step
+- runs deterministic repo-deliverable checks in the judge (for example execution traces, validation split support, and golden-dataset support)
+- records OpenTelemetry spans for `ralph.run/<task>`, `loop.step`, `model.infer`, `tool`, and `judge`
+- writes JSON step artifacts under `.pi/hermes-self-evolution/ralph-runs/`
+
+Use `--telemetry-export otlp-http --otlp-endpoint http://host:4318` to ship traces and metrics to an OTLP collector.
+
 ## Next useful upgrades
 
 - add optional validation hooks (`testCommand`) before recommending a candidate
@@ -216,3 +269,5 @@ npm run python:check
 - add diff rendering in the final report
 - add apply/approve workflows behind explicit confirmation
 - add benchmark/test gates to the Python backend so GEPA mutations are filtered by real task outcomes
+- use validation split for intermediate candidate selection (currently candidates are scored on holdout only)
+- add persistent golden dataset files that survive across runs for consistent benchmarking

@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- add `scripts/ralph_otel.py`, a traced Ralph loop for Hermes-parity gap closure work in this repo
+- add `scripts/tasks/hermes_parity_task.json` as the default parity task spec
+- upgrade the Ralph judge with deterministic repo-deliverable checks for parity targets like execution traces, validation splits, and golden datasets
+- include OpenTelemetry Python dependencies and repo scripts for the Ralph loop workflow
+
 ## 0.2.1 - 2026-04-12
 
 - fix Python backend syntax so CI and `python:check` pass cleanly
