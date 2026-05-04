@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **diff rendering**: every evolution run now writes a `diff.patch` file (original body → best candidate body) and embeds a `## Diff` section in `report.md`
+- **apply/approve workflow**: new `/evolve apply [runDir]` command copies the best candidate to the target file after showing the diff and requiring explicit `"yes"` confirmation; uses the last session run when no `runDir` is provided
+- **artifact-type rubric presets**: the judge now receives type-specific scoring guidance (`skill` / `prompt` / `instructions`) so correctness, procedure-following, and conciseness are weighted appropriately for each artifact kind; parity added in both TypeScript and Python backends
+
 - add `scripts/ralph_otel.py`, a traced Ralph loop for Hermes-parity gap closure work in this repo
 - add `scripts/tasks/hermes_parity_task.json` as the default parity task spec
 - upgrade the Ralph judge with deterministic repo-deliverable checks for parity targets like execution traces, validation splits, and golden datasets
