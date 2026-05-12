@@ -43,6 +43,13 @@ export interface ExecuteCandidateOptions {
  * exit code, and duration as an ExecutionObservation. The candidate text is
  * written to a temp skills directory so the spawned pi process picks it up
  * via --system-prompt (body) and an isolated skills root.
+ *
+ * SOFT-SPOT(meta-shape): the engine's executor log layout (engine.ts safeWriteFile
+ *   for executor/<iter>/<ex>/meta.json) intentionally stores a compact subset
+ *   {exitCode, durationMs, taskInput}; stdout and stderr live alongside as
+ *   sibling stdout.log / stderr.log files rather than being inlined into meta.json.
+ *   The full ExecutionObservation shape is rehydrated by reading the trio together.
+ *   The smoke verifier accepts this split-file layout. see tests/smoke-test-report.md §Soft-spot dispositions.
  */
 export async function executeCandidateInPi(options: ExecuteCandidateOptions): Promise<ExecutionObservation> {
   const tmpRoot = path.join(
