@@ -88,7 +88,8 @@ export type ConstraintName =
   | "placeholder_preservation"
   | "top_heading_preservation"
   | "frontmatter_preservation"
-  | "semantic_drift";
+  | "semantic_drift"
+  | "skill_structure";
 
 export interface ConstraintResult {
   name: ConstraintName;
@@ -140,6 +141,8 @@ export interface CandidateRecord extends CandidateDraft {
   warnings: string[];
   semanticDriftScore?: number;
   testPassed?: boolean;
+  executionObservation?: ExecutionObservation;
+  gateResults?: TieredGateResult[];
 }
 
 export interface EvolutionOptions {
@@ -196,7 +199,64 @@ export interface EvolutionRunResult {
   maxBytes: number;
   baselineTraces: ExecutionTrace[];
   prResult?: PRAutomationResult;
+  iterations?: IterationRecord[];
 }
+
+export interface ReflectionPrompt {
+  priorTraces: ExecutionTrace[];
+  priorJudgeFeedback: string[];
+  objective: string;
+  weaknessSummary: string;
+}
+
+export interface IterationRecord {
+  iteration: number;
+  parentCandidate?: string;
+  mutationRationale: string;
+  reflectionPrompt: ReflectionPrompt;
+  candidate: CandidateDraft;
+  evaluation: ArtifactEvaluation;
+  traces: ExecutionTrace[];
+  scoreDelta: number;
+  accepted: boolean;
+}
+
+export interface ExecutionObservation {
+  stdout: string;
+  stderr: string;
+  exitCode: number;
+  durationMs: number;
+  capturedFiles?: Record<string, string>;
+}
+
+export interface TieredGateResult {
+  tier: "typecheck" | "cohort" | "coherence";
+  passed: boolean;
+  reasonCode: string;
+  detail: string;
+  durationMs: number;
+}
+
+export interface LineageEntry {
+  runId: string;
+  parentRunId?: string;
+  artifactHash: string;
+  parentArtifactHash?: string;
+  score: number;
+  mutationRationale: string;
+  createdAt: string;
+}
+
+export interface SkillStructureReport {
+  hasFrontmatter: boolean;
+  hasName: boolean;
+  hasDescription: boolean;
+  nameInFirst500: boolean;
+  descriptionInFirst500: boolean;
+  errors: string[];
+}
+
+export type BackendMode = "typescript" | "python-accelerate";
 
 export type EvolutionSummaryDetails = ToolSummaryDetails;
 
