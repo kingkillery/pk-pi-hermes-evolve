@@ -13,6 +13,19 @@ function hashContent(content: string): string {
   return crypto.createHash("sha256").update(content).digest("hex").slice(0, 16);
 }
 
+/**
+ * Mirror the engine's slugify convention so callers can pass either a raw artifact
+ * path (e.g., "/abs/path/SKILL.md") and have its basename normalized against the
+ * `<ts>-<slug>` runId format the engine writes.
+ */
+function slugFromPath(artifactPath: string): { basename: string; slug: string } {
+  const basename = path.basename(artifactPath);
+  const ext = path.extname(basename);
+  const nameNoExt = ext ? basename.slice(0, -ext.length) : basename;
+  const slug = nameNoExt.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+  return { basename, slug };
+}
+
 export async function appendLineageEntry(cwd: string, entry: LineageEntry): Promise<void> {
   const file = lineagePath(cwd);
   await fs.mkdir(path.dirname(file), { recursive: true });
@@ -42,10 +55,12 @@ export async function loadLineage(cwd: string): Promise<LineageEntry[]> {
  * Callers usually know an artifact's path before its new content is materialized, so:
  *   - If `artifactContent` is supplied, hash it and return the highest-score entry whose
  *     `artifactHash` matches exactly. This is the precise lookup.
- *   - If only `artifactPath` is supplied, fall back to a path-locality heuristic: prefer
- *     entries whose `runId` contains the artifact basename (engine convention), then take
- *     the highest-score entry from that subset. If nothing matches, return the highest
- *     overall by `score`, or `null` when lineage is empty.
+ *   - If only `artifactPath` is supplied, fall back to a path-locality heuristic: select
+ *     entries whose `runId` contains the artifact basename (engine convention) and return
+ *     the highest-score entry from that subset.
+ *   - When neither an exact content hash match nor a runId-substring match exists, return
+ *     `null` rather than falling back to the global-highest-score entry. This prevents
+ *     false-positive ancestor lookups for unknown paths. See Lane D smoke findings.
  */
 export async function loadBestAncestor(
   cwd: string,
@@ -62,10 +77,10 @@ export async function loadBestAncestor(
     return pickHighestScore(matches);
   }
 
-  const slug = path.basename(artifactPath);
-  const byRunId = entries.filter((e) => e.runId.includes(slug));
-  const pool = byRunId.length > 0 ? byRunId : entries;
-  return pickHighestScore(pool);
+  const { basename, slug } = slugFromPath(artifactPath);
+  const byRunId = entries.filter((e) => e.runId.includes(basename) || (slug.length > 0 && e.runId.includes(slug)));
+  if (byRunId.length === 0) return null;
+  return pickHighestScore(byRunId);
 }
 
 function pickHighestScore(entries: LineageEntry[]): LineageEntry {
