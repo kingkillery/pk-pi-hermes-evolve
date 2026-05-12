@@ -32,6 +32,7 @@ A complete run directory:
 ├── report.md                      ← human-readable summary
 ├── manifest.json                  ← machine-readable summary
 ├── dataset.json                   ← train/val/holdout splits + session snippets used
+├── gate.json                      ← top-level TieredGateResult[] for the best candidate
 ├── candidates/
 │   ├── <name>.md                  ← one per evaluated candidate
 │   └── <name>.json                ← scores, rationale, constraints
@@ -188,6 +189,14 @@ One per iteration of the reflective loop, regardless of whether the iteration's 
 ```
 
 The first iteration's `parentCandidate` is `null` and its `reflectionPrompt.priorTraces` are the baseline traces. Subsequent iterations reference the most recent accepted candidate.
+
+### gate.json (top-level)
+
+Top-level array of `TieredGateResult` objects representing the gate outcomes for the best (selected winner) candidate. Mirrors the contents of the corresponding `iterations/<n>.json#gateResults` for the iteration that produced the winner.
+
+Shape: `TieredGateResult[]` — see [src/types.ts](../src/types.ts) for the field definitions (`tier`, `passed`, `reasonCode`, `detail`, `durationMs`).
+
+Always written, even if empty (`[]`). Empty array indicates no gate ran or the winner had no `gateResults` recorded.
 
 ### `executor/<iter>/<exampleIndex>/`
 

@@ -16,6 +16,14 @@ The TypeScript engine is now the source-of-truth implementation of the Hermes Ph
 - add `tests/api-snapshot.test.ts` to freeze public exports at type level; `tests/e2e-golden.test.ts` to document the expected run-dir shape; `tests/parity.test.ts` with `npm run test:parity` to assert all 18 parity rows remain in the README
 - add `docs/ownership-map.md` documenting the 5-lane disjoint-ownership pattern used to build the above
 
+### Engine hooks promoted to EvolutionOptions
+
+- add `seed?: number` to `EvolutionOptions`; `splitExamples` now uses a deterministic mulberry32 RNG when supplied, falling back to unseeded `Math.random` otherwise
+- add `cohortExamples?: EvalExample[]`, `cohortJudgeFunc?`, and `coherenceCheck?` to `EvolutionOptions`; threaded through to the `runTieredGate` call in the iterative loop, enabling real `cohort_regression` and `coherence_failed` reason codes instead of the previous `skipped_no_cohort` / `skipped_no_check` defaults
+- engine now writes a top-level `gate.json` (containing the best candidate's `TieredGateResult[]`) per run directory, alongside the existing `iterations/<n>.json#gateResults`
+- refactor `scripts/smoke-test.ts` to consume the new hooks; remove the global `Math.random` monkey-patch and synthetic `gate.json` writes that were previously documented as Known Limitations in `tests/smoke-test-report.md`
+- remove the two `// SOFT-SPOT(coherence-default)` and `// SOFT-SPOT(cohort-default)` comments at the `runTieredGate` call site; the corresponding entries in `tests/smoke-test-report.md` Known Limitations are removed
+
 ### Earlier Unreleased work
 
 - add `scripts/ralph_otel.py`, a traced Ralph loop for Hermes-parity gap closure work in this repo
