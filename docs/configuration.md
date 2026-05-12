@@ -21,6 +21,12 @@ These are the inputs accepted by the pi tool exposed in `src/index.ts`. They are
 | `testTimeout` | number (seconds) | 60 | Timeout for `testCommand` execution. |
 | `createPR` | boolean | false | When true and the run produces an improvement, creates a `evolve/<slug>-<ts>` branch with the best candidate, commits it, and attempts `gh pr create`. Restores the original file on the source branch. |
 | `persistGolden` | boolean | true when `goldenTaskId` is set | Persist the split as a golden dataset under `.pi/hermes-self-evolution/golden/<id>/`. |
+| `seed` | number | undefined | Deterministic RNG seed for `splitExamples` and other RNG consumers. When unset, falls back to unseeded `Math.random`. |
+| `cohortExamples` | `EvalExample[]` | undefined | Examples used by the tiered gate's cohort-regression tier. Required to activate `cohort_regression` reason code. |
+| `cohortJudgeFunc` | `(examples: EvalExample[]) => Promise<{composite: number}>` | undefined | Judge callback for the cohort tier. Required when `cohortExamples` is supplied. |
+| `coherenceCheck` | `() => Promise<{passed: boolean; detail: string}>` | undefined | Coherence check callback for the tiered gate's coherence tier. When unset, the tier returns `skipped_no_check`. |
+
+When `cohortExamples` and `cohortJudgeFunc` are supplied together, the tiered gate runs a real cohort-regression check and can return a `cohort_regression` reason code. Supplying `coherenceCheck` enables the coherence tier and replaces the default `skipped_no_check` outcome. Supplying `seed` makes `splitExamples` deterministic. See `src/tiered-gate.ts` for the full gate semantics and tier ordering.
 
 ### Effort and cost guidance
 
