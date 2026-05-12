@@ -42,6 +42,7 @@ type RunEvolutionFn = (options: {
   cohortExamples?: EvalExample[];
   cohortJudgeFunc?: (examples: EvalExample[]) => Promise<{ composite: number }>;
   coherenceCheck?: () => Promise<{ passed: boolean; detail: string }>;
+  tsConfigPath?: string;
 }) => Promise<unknown>;
 
 const FILE = fileURLToPath(import.meta.url);
@@ -53,6 +54,8 @@ const FIXTURE_DIR = path.join(REPO_ROOT, "tests", "fixtures", "smoke-skill");
 const TARGET_PATH = path.join(FIXTURE_DIR, "SKILL.md");
 const FIXTURE_RESPONSES = path.join(FIXTURE_DIR, "mock-llm-responses.json");
 const RUNS_DIR = path.join(REPO_ROOT, ".pi", "hermes-self-evolution", "runs");
+const EXEC_TMP_DIR = path.join(REPO_ROOT, ".pi", "hermes-self-evolution", ".exec-tmp");
+const BROKEN_TSCONFIG_PATH = path.join(EXEC_TMP_DIR, "broken-tsconfig.json");
 
 type MockMode = "default" | "force-typecheck-fail" | "force-cohort-fail" | "force-coherence-fail";
 
@@ -175,7 +178,22 @@ async function getRunEvolution(): Promise<RunEvolutionFn> {
   return runEvolutionRef;
 }
 
-function buildModeCallbacks(mode: MockMode): Pick<Parameters<RunEvolutionFn>[0], "cohortExamples" | "cohortJudgeFunc" | "coherenceCheck"> {
+async function ensureBrokenTsConfig(): Promise<string> {
+  // The typecheck tier runs `tsc --noEmit -p <tsConfigPath>`. Pointing it at a
+  // tsconfig whose `extends` target is missing makes tsc bail with a non-zero
+  // exit before it even reads the project graph, which produces a real
+  // `typecheck_failed` reasonCode without polluting the actual project state.
+  await fs.mkdir(EXEC_TMP_DIR, { recursive: true });
+  await fs.writeFile(BROKEN_TSCONFIG_PATH, `${JSON.stringify({ extends: "./does-not-exist.json" }, null, 2)}\n`, "utf8");
+  return BROKEN_TSCONFIG_PATH;
+}
+
+function buildModeCallbacks(mode: MockMode): Pick<Parameters<RunEvolutionFn>[0], "cohortExamples" | "cohortJudgeFunc" | "coherenceCheck" | "tsConfigPath"> {
+  if (mode === "force-typecheck-fail") {
+    return {
+      tsConfigPath: BROKEN_TSCONFIG_PATH,
+    };
+  }
   if (mode === "force-cohort-fail") {
     const dummyExamples: EvalExample[] = [
       { taskInput: "smoke-cohort-a", expectedBehavior: "any", difficulty: "easy", category: "smoke", source: "synthetic" },
@@ -236,6 +254,9 @@ async function main(): Promise<void> {
   const goldenTaskId = "smoke-skill-v1";
   const stateRoot = path.join(REPO_ROOT, ".pi", "hermes-self-evolution", ".smoke-state");
   await rmrf(stateRoot);
+  // Materialize the broken tsconfig before any run starts so force-typecheck-fail
+  // can hand its path to the engine. The .exec-tmp dir is gitignored.
+  await ensureBrokenTsConfig();
 
   const original = await ensureFixtureRestored();
   const requestedMode = parseModeFromCli();

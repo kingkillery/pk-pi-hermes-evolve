@@ -175,6 +175,8 @@ export interface EvolutionOptions {
   cohortJudgeFunc?: (examples: EvalExample[]) => Promise<{ composite: number }>;
   /** Coherence check callback invoked by the tiered gate's coherence tier. */
   coherenceCheck?: () => Promise<{ passed: boolean; detail: string }>;
+  /** Override the tsconfig path the tiered-gate typecheck tier runs against. Useful for forcing typecheck-tier failure in test scenarios. */
+  tsConfigPath?: string;
 }
 
 export interface EvolutionPaths {
