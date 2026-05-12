@@ -6,11 +6,8 @@ import { withFileMutationQueue } from "@mariozechner/pi-coding-agent";
 import { detectPythonBackend, runPythonBackend } from "./python-backend.js";
 import { mineSessionSnippets } from "./session-history.js";
 import { executeCandidateInPi } from "./pi-executor.js";
-// @ts-expect-error sibling lane (tiered-gate) will land this module at merge time
 import { runTieredGate } from "./tiered-gate.js";
-// @ts-expect-error sibling lane (structural-and-lineage) will land this module at merge time
 import { checkSkillStructure } from "./constraints-structure.js";
-// @ts-expect-error sibling lane (structural-and-lineage) will land this module at merge time
 import { appendLineageEntry, loadBestAncestor } from "./lineage.js";
 import type {
   AggregateScore,
@@ -499,7 +496,7 @@ async function runTypeScriptEvolution(options: {
     }
     // Tiered gate (sibling lane will provide module)
     let gateResults: TieredGateResult[] | undefined;
-    try { gateResults = await runTieredGate({ cwd: options.cwd, candidateFullText: fullText, target, signal: options.signal }) as TieredGateResult[]; } catch { /* sibling module unavailable; skip */ }
+    try { gateResults = await runTieredGate({ cwd: options.cwd, candidateText: fullText, signal: options.signal }); } catch { /* gate unavailable; skip */ }
     const constraintsPass = cr.results.every((r) => r.passed); const composite = evaluation.aggregate.composite; const scoreDelta = composite - priorComposite; const accepted = constraintsPass && scoreDelta > 0 && (testPassed === undefined ? true : testPassed);
     const candidateRecord: CandidateRecord = { ...draft, candidateFullText: fullText, evaluation, executionTraces: cTraces, constraints: cr.results, warnings: cr.warnings, semanticDriftScore: driftScore, testPassed, gateResults };
     const iterRecord: IterationRecord = { iteration: iter, parentCandidate: parentName, mutationRationale: draft.rationale, reflectionPrompt: reflection, candidate: { name: draft.name, rationale: draft.rationale, candidateBody: draft.candidateBody }, evaluation, traces: cTraces, scoreDelta, accepted };
@@ -648,7 +645,7 @@ export function buildToolSummary(r: EvolutionSummaryDetails): string {
 
 export function toToolSummaryDetails(result: EvolutionRunResult): EvolutionSummaryDetails {
   const allTraces = [...result.baselineTraces, ...result.candidates.flatMap((c) => c.executionTraces)];
-  return { runDir: result.paths.runDir, reportPath: result.paths.reportPath, targetPath: result.target.path, objective: result.objective, evalSource: result.evalSource, modelLabel: result.modelLabel, selectionSplit: result.selectionSplit, confirmationSplit: result.confirmationSplit, trainExamples: result.trainExamples.length, validationExamples: result.validationExamples.length, holdoutExamples: result.holdoutExamples.length, goldenTaskId: result.golden?.id ?? null, candidateCount: result.candidates.length, baselineValidationScore: result.baselineValidation.aggregate.composite, bestValidationScore: result.bestCandidate.evaluation.aggregate.composite, baselineHoldoutScore: result.baselineHoldout.aggregate.composite, bestHoldoutScore: result.bestCandidate.holdoutEvaluation?.aggregate.composite ?? result.bestCandidate.evaluation.aggregate.composite, improvement: result.improvement, bestCandidateName: result.bestCandidate.name, tracesCaptured: allTraces.length, constraintsPassed: result.bestCandidate.constraints.length > 0 ? result.bestCandidate.constraints.every((c) => c.passed) : true, testGatePassed: result.bestCandidate.testPassed, semanticDriftScore: result.bestCandidate.semanticDriftScore, prBranch: result.prResult?.branch, backend: "typescript", optimizerUsed: "typescript-proxy" };
+  return { runDir: result.paths.runDir, reportPath: result.paths.reportPath, targetPath: result.target.path, objective: result.objective, evalSource: result.evalSource, modelLabel: result.modelLabel, selectionSplit: result.selectionSplit, confirmationSplit: result.confirmationSplit, trainExamples: result.trainExamples.length, validationExamples: result.validationExamples.length, holdoutExamples: result.holdoutExamples.length, goldenTaskId: result.golden?.id ?? null, candidateCount: result.candidates.length, baselineValidationScore: result.baselineValidation.aggregate.composite, bestValidationScore: result.bestCandidate.evaluation.aggregate.composite, baselineHoldoutScore: result.baselineHoldout.aggregate.composite, bestHoldoutScore: result.bestCandidate.holdoutEvaluation?.aggregate.composite ?? result.bestCandidate.evaluation.aggregate.composite, improvement: result.improvement, bestCandidateName: result.bestCandidate.name, tracesCaptured: allTraces.length, constraintsPassed: result.bestCandidate.constraints.length > 0 ? result.bestCandidate.constraints.every((c) => c.passed) : true, testGatePassed: result.bestCandidate.testPassed, semanticDriftScore: result.bestCandidate.semanticDriftScore, prBranch: result.prResult?.branch, backend: "typescript", optimizerUsed: "gepa-iterative" };
 }
 
 export type { EvolutionSummaryDetails, ToolSummaryDetails } from "./types.js";
