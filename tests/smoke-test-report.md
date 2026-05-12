@@ -16,9 +16,13 @@ instead of a global-highest-score entry when no exact content or
 runId-substring match exists, and now mirrors the engine's slugify
 convention so the path-locality heuristic actually works; (3) the engine
 writes `parentArtifactHash` as the *ancestor's* `artifactHash`, fixing
-cross-run hash chaining. The remaining soft spots (cohort-default,
-coherence-default, executor `meta.json` shape) are documented inline as
-`// SOFT-SPOT(<id>)` comments and intentionally deferred.
+cross-run hash chaining. The follow-up engine-hooks dispatch then
+promoted `seed`, `cohortExamples`, `cohortJudgeFunc`, `coherenceCheck`,
+and `tsConfigPath` to first-class `EvolutionOptions` fields and made the
+engine emit a top-level `gate.json` per run, retiring the smoke driver's
+`Math.random` monkey-patch and synthetic `gate.json` writes. The only
+remaining inline soft-spot is the executor `meta.json` split-file shape,
+which the verifier accepts.
 
 ## Run artifacts
 
@@ -210,14 +214,12 @@ From `.prd/smoke-test-orchestration.md` §Acceptance criteria:
   stdout/stderr into the JSON. The verifier accepts the split-file
   layout; reassemble by reading the trio together.
 
-Additional smoke-time-only quirks (not soft spots, recorded for
-context):
+### Closed in engine-hooks follow-up
 
-- The smoke driver monkey-patches `Math.random` via
-  `seedDeterministicRandom` so `splitExamples` is reproducible. A
-  real engine-level `seed?: number` on `EvolutionOptions` would
-  obviate this; deferred to a follow-up.
-- Forced-failure runs synthesize `gate.json` and overwrite
-  `iterations/<n>.json#gateResults` so the tiered-gate verifier sees
-  the failure codes without the engine itself wiring real callbacks.
-  Documented in `scripts/smoke-test.ts:injectForcedGateResults`.
+The two engine-hook gaps deferred in the original smoke-test run have been closed:
+
+- `seed?: number` on `EvolutionOptions` is now threaded into `splitExamples` via a local mulberry32 RNG. The smoke driver passes `seed: 0xC0FFEE` directly; the global `Math.random` monkey-patch is removed.
+- `cohortExamples` / `cohortJudgeFunc` / `coherenceCheck` are now first-class `EvolutionOptions` fields, threaded into the `runTieredGate` call. The engine writes a top-level `gate.json` per run dir. The smoke driver invokes real callbacks for `MOCK_MODE=force-cohort-fail` and `MOCK_MODE=force-coherence-fail`; no synthetic `gate.json` writes remain.
+- `tsConfigPath?: string` was also added so `MOCK_MODE=force-typecheck-fail` can point the typecheck tier at a deliberately broken tsconfig and produce a real `typecheck_failed` reason code.
+
+See CHANGELOG `Unreleased` § "Engine hooks promoted to EvolutionOptions" for the full set of changes.

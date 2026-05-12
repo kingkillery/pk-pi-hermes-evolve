@@ -443,6 +443,7 @@ async function runTypeScriptEvolution(options: {
   seed?: number; cohortExamples?: EvalExample[];
   cohortJudgeFunc?: (examples: EvalExample[]) => Promise<{ composite: number }>;
   coherenceCheck?: () => Promise<{ passed: boolean; detail: string }>;
+  tsConfigPath?: string;
   signal?: AbortSignal; onProgress?: (phase: string, detail?: string) => void;
 }): Promise<EvolutionRunResult> {
   const target = await resolveArtifactTarget(options.targetPath, options.cwd);
@@ -519,6 +520,7 @@ async function runTypeScriptEvolution(options: {
         cohortExamples: options.cohortExamples,
         judgeFunc: options.cohortJudgeFunc,
         coherenceCheck: options.coherenceCheck,
+        tsConfigPath: options.tsConfigPath,
         baselineScore: baselineHoldout.aggregate.composite,
       });
     } catch { /* gate unavailable; skip */ }
@@ -663,6 +665,7 @@ export async function runEvolution(options: {
   seed?: number; cohortExamples?: EvalExample[];
   cohortJudgeFunc?: (examples: EvalExample[]) => Promise<{ composite: number }>;
   coherenceCheck?: () => Promise<{ passed: boolean; detail: string }>;
+  tsConfigPath?: string;
   signal?: AbortSignal; onProgress?: (phase: string, detail?: string) => void;
 }): Promise<EvolutionSummaryDetails> {
   const preferred = options.backend ?? "auto";
