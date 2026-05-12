@@ -167,6 +167,14 @@ export interface EvolutionOptions {
   testTimeout?: number;
   createPR?: boolean;
   persistGolden?: boolean;
+  /** Deterministic seed for splitExamples and any future RNG consumers. When unset, falls back to unseeded Math.random. */
+  seed?: number;
+  /** Cohort of EvalExamples used by the tiered gate's cohort-regression tier. */
+  cohortExamples?: EvalExample[];
+  /** Judge callback invoked by the tiered gate to score the cohort. Required when cohortExamples is supplied. */
+  cohortJudgeFunc?: (examples: EvalExample[]) => Promise<{ composite: number }>;
+  /** Coherence check callback invoked by the tiered gate's coherence tier. */
+  coherenceCheck?: () => Promise<{ passed: boolean; detail: string }>;
 }
 
 export interface EvolutionPaths {
