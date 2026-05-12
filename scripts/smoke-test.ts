@@ -18,7 +18,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { register } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import type { TieredGateResult } from "../src/types.ts";
+import type { EvalExample } from "../src/types.ts";
 
 type RunEvolutionFn = (options: {
   cwd: string;
@@ -38,6 +38,10 @@ type RunEvolutionFn = (options: {
   sessionQuery?: string;
   signal?: AbortSignal;
   onProgress?: (phase: string, detail?: string) => void;
+  seed?: number;
+  cohortExamples?: EvalExample[];
+  cohortJudgeFunc?: (examples: EvalExample[]) => Promise<{ composite: number }>;
+  coherenceCheck?: () => Promise<{ passed: boolean; detail: string }>;
 }) => Promise<unknown>;
 
 const FILE = fileURLToPath(import.meta.url);
@@ -102,19 +106,6 @@ function parseModeFromCli(): MockMode | undefined {
   return undefined;
 }
 
-function seedDeterministicRandom(seed: number): void {
-  // Mulberry32: simple and deterministic. Replaces Math.random for this process
-  // so the engine's splitExamples shuffle becomes reproducible across runs.
-  let state = seed >>> 0;
-  Math.random = function deterministicRandom(): number {
-    state = (state + 0x6d2b79f5) >>> 0;
-    let t = state;
-    t = Math.imul(t ^ (t >>> 15), t | 1);
-    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-
 function setupEnv(mode: MockMode, stateDir: string): void {
   // We rely on re-entrance, so leave process.argv[1] alone — it points at this
   // file, and the engine will spawn `node <this-file> …` which re-enters via
@@ -140,14 +131,6 @@ async function rmrf(target: string): Promise<void> {
   }
 }
 
-async function readJson<T>(file: string): Promise<T | null> {
-  try {
-    return JSON.parse(await fs.readFile(file, "utf8")) as T;
-  } catch {
-    return null;
-  }
-}
-
 async function listRunDirsAfter(startedAt: number): Promise<string[]> {
   let entries: string[];
   try {
@@ -167,75 +150,6 @@ async function listRunDirsAfter(startedAt: number): Promise<string[]> {
   }
   out.sort();
   return out;
-}
-
-function forcedGateResults(mode: MockMode): TieredGateResult[] {
-  // Forced-failure modes synthesize the TieredGateResult shape downstream
-  // verifiers expect. Lane C reads iterations/<n>.json#gateResults to confirm
-  // distinct reasonCodes across runs. See .prd/smoke-A-fixture-and-runs.md §5
-  // and the Lane E hand-off note about wiring a real coherenceCheck callback.
-  const baseMs = 5;
-  if (mode === "force-typecheck-fail") {
-    return [
-      {
-        tier: "typecheck",
-        passed: false,
-        reasonCode: "typecheck_failed",
-        detail: "smoke-synthesized typecheck failure for forced-failure mode",
-        durationMs: baseMs,
-      },
-    ];
-  }
-  if (mode === "force-cohort-fail") {
-    return [
-      { tier: "typecheck", passed: true, reasonCode: "ok", detail: "typecheck clean", durationMs: baseMs },
-      {
-        tier: "cohort",
-        passed: false,
-        reasonCode: "cohort_regression",
-        detail: "smoke-synthesized cohort regression for forced-failure mode (delta=-0.30, threshold=-0.02)",
-        durationMs: baseMs,
-      },
-    ];
-  }
-  if (mode === "force-coherence-fail") {
-    return [
-      { tier: "typecheck", passed: true, reasonCode: "ok", detail: "typecheck clean", durationMs: baseMs },
-      { tier: "cohort", passed: true, reasonCode: "ok", detail: "delta=0.0000", durationMs: baseMs },
-      {
-        tier: "coherence",
-        passed: false,
-        reasonCode: "coherence_failed",
-        detail: "smoke-synthesized coherence failure for forced-failure mode (no real coherenceCheck wired in engine)",
-        durationMs: baseMs,
-      },
-    ];
-  }
-  return [];
-}
-
-async function injectForcedGateResults(runDir: string, mode: MockMode): Promise<void> {
-  if (mode === "default") return;
-  const forced = forcedGateResults(mode);
-  // Persist a top-level gate.json so Lane C can read it without spelunking
-  // through iterations/*.json#gateResults.
-  await fs.writeFile(path.join(runDir, "gate.json"), JSON.stringify(forced, null, 2), "utf8");
-  const iterDir = path.join(runDir, "iterations");
-  let names: string[];
-  try {
-    names = await fs.readdir(iterDir);
-  } catch {
-    return;
-  }
-  for (const n of names) {
-    if (!n.endsWith(".json")) continue;
-    const file = path.join(iterDir, n);
-    const data = await readJson<Record<string, unknown>>(file);
-    if (!data) continue;
-    data.gateResults = forced;
-    data.forcedMockMode = mode;
-    await fs.writeFile(file, JSON.stringify(data, null, 2), "utf8");
-  }
 }
 
 async function ensureFixtureRestored(): Promise<string> {
@@ -261,6 +175,25 @@ async function getRunEvolution(): Promise<RunEvolutionFn> {
   return runEvolutionRef;
 }
 
+function buildModeCallbacks(mode: MockMode): Pick<Parameters<RunEvolutionFn>[0], "cohortExamples" | "cohortJudgeFunc" | "coherenceCheck"> {
+  if (mode === "force-cohort-fail") {
+    const dummyExamples: EvalExample[] = [
+      { taskInput: "smoke-cohort-a", expectedBehavior: "any", difficulty: "easy", category: "smoke", source: "synthetic" },
+      { taskInput: "smoke-cohort-b", expectedBehavior: "any", difficulty: "easy", category: "smoke", source: "synthetic" },
+    ];
+    return {
+      cohortExamples: dummyExamples,
+      cohortJudgeFunc: async () => ({ composite: 0.1 }),
+    };
+  }
+  if (mode === "force-coherence-fail") {
+    return {
+      coherenceCheck: async () => ({ passed: false, detail: "smoke: forced coherence failure" }),
+    };
+  }
+  return {};
+}
+
 async function runOnce(opts: {
   mode: MockMode;
   goldenTaskId: string;
@@ -281,6 +214,8 @@ async function runOnce(opts: {
     maxExamples: 4,
     goldenTaskId: opts.goldenTaskId,
     persistGolden: true,
+    seed: 0xC0FFEE,
+    ...buildModeCallbacks(opts.mode),
     onProgress: (phase, detail) => {
       process.stderr.write(`[smoke:${opts.mode}] ${phase}${detail ? `: ${detail}` : ""}\n`);
     },
@@ -290,7 +225,6 @@ async function runOnce(opts: {
   if (dirs.length === 0) throw new Error(`[smoke:${opts.mode}] no run dir was emitted under ${RUNS_DIR}`);
   // Pick the newest emitted dir (the run we just produced).
   const runDir = dirs[dirs.length - 1]!;
-  await injectForcedGateResults(runDir, opts.mode);
   return runDir;
 }
 
@@ -299,9 +233,6 @@ async function sleep(ms: number): Promise<void> {
 }
 
 async function main(): Promise<void> {
-  // Deterministic randomness for splitExamples + any other Math.random consumers.
-  seedDeterministicRandom(0xC0FFEE);
-
   const goldenTaskId = "smoke-skill-v1";
   const stateRoot = path.join(REPO_ROOT, ".pi", "hermes-self-evolution", ".smoke-state");
   await rmrf(stateRoot);
