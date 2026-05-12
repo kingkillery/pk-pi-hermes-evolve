@@ -298,8 +298,20 @@ function normalizeExamples(payload: unknown, evalSource: EvalSource): EvalExampl
   }).filter((item): item is EvalExample => Boolean(item));
 }
 
-function splitExamples(examples: EvalExample[]): { train: EvalExample[]; validation: EvalExample[]; holdout: EvalExample[] } {
-  const s = [...examples]; for (let i = s.length - 1; i > 0; i -= 1) { const j = Math.floor(Math.random() * (i + 1)); [s[i], s[j]] = [s[j]!, s[i]!]; }
+function mulberry32(seed: number): () => number {
+  let s = seed >>> 0;
+  return () => {
+    s = (s + 0x6d2b79f5) >>> 0;
+    let t = s;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function splitExamples(examples: EvalExample[], seed?: number): { train: EvalExample[]; validation: EvalExample[]; holdout: EvalExample[] } {
+  const rng = seed !== undefined ? mulberry32(seed) : Math.random;
+  const s = [...examples]; for (let i = s.length - 1; i > 0; i -= 1) { const j = Math.floor(rng() * (i + 1)); [s[i], s[j]] = [s[j]!, s[i]!]; }
   const tc = Math.max(3, Math.ceil(s.length * 0.5)); const vc = Math.max(1, Math.floor(s.length * 0.2));
   const train = s.slice(0, tc); const validation = s.slice(tc, tc + vc); const holdout = s.slice(tc + vc);
   if (holdout.length === 0 && train.length > 2) holdout.push(train.pop()!);
@@ -428,6 +440,9 @@ async function runTypeScriptEvolution(options: {
   cwd: string; targetPath: string; objective: string; evalSource: EvalSource; model?: string; thinkingLevel?: string;
   candidateCount: number; maxExamples: number; sessionQuery?: string; goldenTaskId?: string;
   testCommand?: string; testTimeout?: number; createPR?: boolean; persistGolden?: boolean;
+  seed?: number; cohortExamples?: EvalExample[];
+  cohortJudgeFunc?: (examples: EvalExample[]) => Promise<{ composite: number }>;
+  coherenceCheck?: () => Promise<{ passed: boolean; detail: string }>;
   signal?: AbortSignal; onProgress?: (phase: string, detail?: string) => void;
 }): Promise<EvolutionRunResult> {
   const target = await resolveArtifactTarget(options.targetPath, options.cwd);
@@ -446,7 +461,7 @@ async function runTypeScriptEvolution(options: {
   if (!usedPersistedGolden) {
     options.onProgress?.("dataset", "Generating evaluation set");
     const ds = await generateDataset({ cwd: options.cwd, model: options.model, thinkingLevel: options.thinkingLevel, target, objective: options.objective, evalSource: options.evalSource, maxExamples: Math.max(4, options.maxExamples), sessionQuery: options.sessionQuery, signal: options.signal, onProgress: (d) => options.onProgress?.("dataset", d) });
-    const splits = splitExamples(ds.examples); train = splits.train; validation = splits.validation; holdout = splits.holdout; sessionSnippets = ds.sessionSnippets;
+    const splits = splitExamples(ds.examples, options.seed); train = splits.train; validation = splits.validation; holdout = splits.holdout; sessionSnippets = ds.sessionSnippets;
   }
   const golden = buildGoldenDataset(validation, options.goldenTaskId);
   if (golden && options.persistGolden !== false && !usedPersistedGolden) await saveGoldenDataset(options.cwd, golden, train, validation, holdout, target.path, target.name);
@@ -494,15 +509,19 @@ async function runTypeScriptEvolution(options: {
       testPassed = tr.passed; await safeWriteFile(target.path, target.fullText);
       if (!tr.passed) cr.warnings.push(`Test failed (exit ${tr.exitCode})`);
     }
-    // Tiered gate (sibling lane will provide module)
-    // SOFT-SPOT(cohort-default): cohortExamples/judgeFunc/baselineScore are not threaded
-    //   into runTieredGate, so the cohort tier always emits reasonCode "skipped_no_cohort".
-    //   Intentional for Phase 1 until a curated cohort exists. see tests/smoke-test-report.md §Soft-spot dispositions.
-    // SOFT-SPOT(coherence-default): no coherenceCheck callback is wired, so the coherence
-    //   tier always emits reasonCode "skipped_no_check". Intentional for Phase 1 because
-    //   cross-skill coherence is not curated. see tests/smoke-test-report.md §Soft-spot dispositions.
+    // Tiered gate: real callbacks threaded from EvolutionOptions; skip-codes still apply when callbacks are unset.
     let gateResults: TieredGateResult[] | undefined;
-    try { gateResults = await runTieredGate({ cwd: options.cwd, candidateText: fullText, signal: options.signal }); } catch { /* gate unavailable; skip */ }
+    try {
+      gateResults = await runTieredGate({
+        cwd: options.cwd,
+        candidateText: fullText,
+        signal: options.signal,
+        cohortExamples: options.cohortExamples,
+        judgeFunc: options.cohortJudgeFunc,
+        coherenceCheck: options.coherenceCheck,
+        baselineScore: baselineHoldout.aggregate.composite,
+      });
+    } catch { /* gate unavailable; skip */ }
     const constraintsPass = cr.results.every((r) => r.passed); const composite = evaluation.aggregate.composite; const scoreDelta = composite - priorComposite; const accepted = constraintsPass && scoreDelta > 0 && (testPassed === undefined ? true : testPassed);
     const candidateRecord: CandidateRecord = { ...draft, candidateFullText: fullText, evaluation, executionTraces: cTraces, constraints: cr.results, warnings: cr.warnings, semanticDriftScore: driftScore, testPassed, gateResults };
     const iterRecord: IterationRecord = { iteration: iter, parentCandidate: parentName, mutationRationale: draft.rationale, reflectionPrompt: reflection, candidate: { name: draft.name, rationale: draft.rationale, candidateBody: draft.candidateBody }, evaluation, traces: cTraces, scoreDelta, accepted };
@@ -619,6 +638,8 @@ async function runTypeScriptEvolution(options: {
   await safeWriteFile(path.join(tracesDir, "all-traces.json"), JSON.stringify(allTraces, null, 2));
   const failureOnly = allTraces.filter((t) => t.isFailure);
   if (failureOnly.length > 0) await safeWriteFile(path.join(tracesDir, "failure-traces.json"), JSON.stringify(failureOnly, null, 2));
+  // Top-level gate.json with best candidate's tier results (always written, even when empty).
+  await safeWriteFile(path.join(runDir, "gate.json"), JSON.stringify(bestCandidate.gateResults ?? [], null, 2));
   // Lineage: append entry linking this run to its ancestor (sibling lane provides module).
   try {
     const bestHoldoutComposite = bestCandidate.holdoutEvaluation?.aggregate.composite ?? bestCandidate.evaluation.aggregate.composite;
@@ -639,6 +660,9 @@ export async function runEvolution(options: {
   cwd: string; targetPath: string; objective: string; evalSource: EvalSource; model?: string; thinkingLevel?: string;
   candidateCount: number; maxExamples: number; sessionQuery?: string; backend?: "auto" | "typescript" | "python";
   goldenTaskId?: string; testCommand?: string; testTimeout?: number; createPR?: boolean; persistGolden?: boolean;
+  seed?: number; cohortExamples?: EvalExample[];
+  cohortJudgeFunc?: (examples: EvalExample[]) => Promise<{ composite: number }>;
+  coherenceCheck?: () => Promise<{ passed: boolean; detail: string }>;
   signal?: AbortSignal; onProgress?: (phase: string, detail?: string) => void;
 }): Promise<EvolutionSummaryDetails> {
   const preferred = options.backend ?? "auto";
