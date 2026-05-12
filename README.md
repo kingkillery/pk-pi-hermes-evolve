@@ -18,6 +18,19 @@ It is a **pi-native extension** with a **TypeScript-native engine**:
 
 The core loop is modeled after Hermes' mutation → evaluation → guardrails → human review flow, but adapted to pi extension APIs and local pi session history.
 
+## Documentation
+
+| Document | Contents |
+|---|---|
+| [docs/architecture.md](docs/architecture.md) | Module map, end-to-end run pipeline, iterative loop, executor, tiered gate, constraint pipeline, lineage, backend selection |
+| [docs/configuration.md](docs/configuration.md) | Every tool parameter, `/evolve` flag, env var, constraint config option, and common recipes |
+| [docs/output-layout.md](docs/output-layout.md) | Run-directory format, manifest / dataset / iteration / executor / trace schemas, lineage and golden dataset layouts |
+| [docs/ownership-map.md](docs/ownership-map.md) | The 5-lane disjoint-ownership pattern used to land Phase 1 parity |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | Code organization, style, verification gates, parallel-PRD dispatch pattern, soft-spot policy, release process |
+| [CHANGELOG.md](CHANGELOG.md) | Version history |
+
+The full documentation index is at [docs/README.md](docs/README.md).
+
 ## Pi docs reviewed for this package
 
 This package was designed against pi's extension/package docs and examples, especially:
