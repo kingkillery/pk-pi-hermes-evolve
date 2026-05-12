@@ -143,6 +143,13 @@ export interface CandidateRecord extends CandidateDraft {
   testPassed?: boolean;
   executionObservation?: ExecutionObservation;
   gateResults?: TieredGateResult[];
+  /**
+   * True when this candidate was promoted by the engine's fallback acceptance
+   * path because no iteration met the strict score-delta + constraints gate.
+   * Surfaced in manifest.json#bestCandidate so downstream tools can detect
+   * degenerate "winner" promotion without spelunking `warnings`.
+   */
+  wasFallbackPromoted?: boolean;
 }
 
 export interface EvolutionOptions {

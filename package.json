@@ -47,7 +47,9 @@
     "ralph:parity": "python scripts/ralph_otel.py --task-file scripts/tasks/hermes_parity_task.json --repo . --telemetry-export console",
     "benchmark:sokoban:help": "python scripts/sokoban_benchmark.py --help",
     "test:parity": "node --experimental-strip-types -e \"import('./tests/parity.test.ts').then(m => { const r = m.runParityGate(); console.log('parity:', JSON.stringify(r)); }).catch(e => { console.error('FAIL:', e.message); process.exit(1); })\"",
-    "test:gates": "npm run typecheck && npm run python:check && npm run test:parity"
+    "smoke": "node --experimental-strip-types scripts/smoke-test.ts",
+    "test:smoke": "node scripts/run-smoke-tests.mjs",
+    "test:gates": "npm run typecheck && npm run python:check && npm run test:parity && npm run test:smoke"
   },
   "publishConfig": {
     "access": "public"

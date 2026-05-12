@@ -495,6 +495,12 @@ async function runTypeScriptEvolution(options: {
       if (!tr.passed) cr.warnings.push(`Test failed (exit ${tr.exitCode})`);
     }
     // Tiered gate (sibling lane will provide module)
+    // SOFT-SPOT(cohort-default): cohortExamples/judgeFunc/baselineScore are not threaded
+    //   into runTieredGate, so the cohort tier always emits reasonCode "skipped_no_cohort".
+    //   Intentional for Phase 1 until a curated cohort exists. see tests/smoke-test-report.md §Soft-spot dispositions.
+    // SOFT-SPOT(coherence-default): no coherenceCheck callback is wired, so the coherence
+    //   tier always emits reasonCode "skipped_no_check". Intentional for Phase 1 because
+    //   cross-skill coherence is not curated. see tests/smoke-test-report.md §Soft-spot dispositions.
     let gateResults: TieredGateResult[] | undefined;
     try { gateResults = await runTieredGate({ cwd: options.cwd, candidateText: fullText, signal: options.signal }); } catch { /* gate unavailable; skip */ }
     const constraintsPass = cr.results.every((r) => r.passed); const composite = evaluation.aggregate.composite; const scoreDelta = composite - priorComposite; const accepted = constraintsPass && scoreDelta > 0 && (testPassed === undefined ? true : testPassed);
@@ -511,7 +517,8 @@ async function runTypeScriptEvolution(options: {
     const best = [...iterations].sort((a, b) => b.evaluation.aggregate.composite - a.evaluation.aggregate.composite)[0]!;
     const fullText = reassembleArtifact(target.frontmatter, best.candidate.candidateBody);
     const cr = validateConstraints(target, best.candidate.candidateBody, fullText, constraintConfig);
-    candidates.push({ ...best.candidate, candidateFullText: fullText, evaluation: best.evaluation, executionTraces: best.traces, constraints: cr.results, warnings: [...cr.warnings, "Fallback acceptance: no iteration met strict acceptance criteria."], semanticDriftScore: undefined, testPassed: undefined });
+    options.onProgress?.("iterations", `Fallback acceptance: no iteration met strict criteria; promoting "${best.candidate.name}" (composite=${best.evaluation.aggregate.composite.toFixed(3)})`);
+    candidates.push({ ...best.candidate, candidateFullText: fullText, evaluation: best.evaluation, executionTraces: best.traces, constraints: cr.results, warnings: [...cr.warnings, "Fallback acceptance: no iteration met strict acceptance criteria."], semanticDriftScore: undefined, testPassed: undefined, wasFallbackPromoted: true });
   }
   candidates.sort((a, b) => b.evaluation.aggregate.composite - a.evaluation.aggregate.composite);
   const bestCandidate = candidates[0]!;
@@ -589,6 +596,8 @@ async function runTypeScriptEvolution(options: {
       constraints: bestCandidate.constraints,
       semanticDriftScore: bestCandidate.semanticDriftScore,
       testPassed: bestCandidate.testPassed,
+      acceptanceMode: bestCandidate.wasFallbackPromoted ? "fallback" : "strict",
+      wasFallbackPromoted: bestCandidate.wasFallbackPromoted === true,
     },
     candidates: candidates.map((c) => ({
       name: c.name,
@@ -614,9 +623,13 @@ async function runTypeScriptEvolution(options: {
   try {
     const bestHoldoutComposite = bestCandidate.holdoutEvaluation?.aggregate.composite ?? bestCandidate.evaluation.aggregate.composite;
     const artifactHash = crypto.createHash("sha256").update(bestCandidate.candidateFullText).digest("hex").slice(0, 16);
-    const parentArtifactHash = crypto.createHash("sha256").update(target.fullText).digest("hex").slice(0, 16);
+    // parentArtifactHash should reference the prior run's winning artifactHash (cross-run
+    // chaining), falling back to the pre-mutation source hash only when there is no ancestor.
+    const ancestorEntry = ancestor as LineageEntry | undefined;
+    const parentArtifactHash = ancestorEntry?.artifactHash
+      ?? crypto.createHash("sha256").update(target.fullText).digest("hex").slice(0, 16);
     const runId = path.basename(runDir);
-    const entry: LineageEntry = { runId, parentRunId: (ancestor as LineageEntry | undefined)?.runId, artifactHash, parentArtifactHash, score: bestHoldoutComposite, mutationRationale: bestCandidate.rationale, createdAt: new Date().toISOString() };
+    const entry: LineageEntry = { runId, parentRunId: ancestorEntry?.runId, artifactHash, parentArtifactHash, score: bestHoldoutComposite, mutationRationale: bestCandidate.rationale, createdAt: new Date().toISOString() };
     await appendLineageEntry(options.cwd, entry);
   } catch { /* sibling module unavailable */ }
   return result;
