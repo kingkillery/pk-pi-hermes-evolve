@@ -11,10 +11,10 @@ This package adapts the *Hermes Phase 1 idea* to pi:
 - save a reviewable report and candidate files under `.pi/hermes-self-evolution/`
 - **never overwrite the original target automatically**
 
-It is a **pi-native extension** with a **hybrid backend model**:
+It is a **pi-native extension** with a **TypeScript-native engine**:
 
-- **TypeScript backend**: always available, uses pi subprocess calls as a local proxy-evolution loop
-- **Python backend**: optional, uses a real DSPy/GEPA-style path when Python + DSPy are installed
+- **TypeScript backend**: the source-of-truth implementation — iterative reflective loop, Hermes-weighted judge, tiered constraint pipeline, execution traces, golden datasets, PR automation
+- **Python acceleration mode**: optional sidecar (`--accelerate`) — activates when Python + DSPy are installed; adds a DSPy/GEPA optimizer path on top of the TS engine's same guardrails
 
 The core loop is modeled after Hermes' mutation → evaluation → guardrails → human review flow, but adapted to pi extension APIs and local pi session history.
 
@@ -71,9 +71,9 @@ Use it when you explicitly want the model to improve a local instruction artifac
 
 ### Backends
 
-- `auto` → prefer Python DSPy backend when available, otherwise TypeScript fallback
-- `python` → require the Python backend
-- `typescript` → force the TypeScript-only path
+- `typescript` → TypeScript engine (default; always available)
+- `--accelerate` / `auto` → TypeScript engine + Python DSPy acceleration when available
+- `python` → require the Python acceleration sidecar (error if unavailable)
 
 ## Install
 
@@ -97,25 +97,25 @@ pi install -l npm:pk-pi-hermes-evolve
 pi -e npm:pk-pi-hermes-evolve
 ```
 
-## Python DSPy backend
+## Python acceleration mode (optional)
 
-The npm package includes an optional Python sidecar under `python_backend/`.
+The npm package includes an optional Python sidecar under `python_backend/`. The TypeScript engine is fully functional without it.
 
-Install it manually if you want the hybrid DSPy/GEPA path:
+Install the sidecar if you want DSPy/GEPA acceleration:
 
 ```bash
 cd python_backend
 pip install -e .
 ```
 
-The extension looks for Python in this order:
+The extension searches for Python in this order:
 
 1. `PI_HERMES_EVOLVE_PYTHON`
 2. `python3`
 3. `python`
 
-If DSPy is installed, `backend: auto` will use the Python backend.
-Otherwise it falls back to TypeScript.
+When DSPy is detected and `backend` is `auto`, the Python acceleration sidecar is activated.
+Without it, the TypeScript engine runs the full evolution loop on its own.
 
 ## Usage
 
@@ -203,12 +203,13 @@ Current guardrails mirror Hermes' spirit, but stay lightweight and local:
 
 This is still **not** a full Hermes reproduction.
 
-What the Python upgrade adds:
+What the Python acceleration mode adds (optional, on top of the TS engine):
 
-- a real Python backend bundled with the npm package
 - DSPy-based dataset generation, judging, and candidate synthesis
-- a GEPA path when the installed DSPy build exposes `dspy.GEPA`
-- automatic fallback to MIPROv2 or plain Chain-of-Thought if GEPA is unavailable
+- a GEPA optimizer path when the installed DSPy build exposes `dspy.GEPA`
+- automatic degradation to MIPROv2 or plain Chain-of-Thought if GEPA is unavailable
+
+The TypeScript engine is feature-complete for Phase 1 on its own. Python acceleration is an opt-in layer.
 
 What the latest parity upgrade adds:
 
