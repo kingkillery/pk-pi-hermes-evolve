@@ -199,33 +199,38 @@ Current guardrails mirror Hermes' spirit, but stay lightweight and local:
 - candidates over the size budget are rejected
 - human review is always required before applying changes
 
-## Important limitations
+## Hermes Phase 1 parity
 
-This is still **not** a full Hermes reproduction.
+The TypeScript engine implements the Hermes Phase 1 workflow end-to-end. Status by capability:
 
-What the Python acceleration mode adds (optional, on top of the TS engine):
+| Capability | Status | Where |
+|---|---|---|
+| 3-source dataset (synthetic / session / mixed) | ✅ | `generateDataset` in `src/engine.ts` |
+| Train / validation / holdout split | ✅ | `splitExamples` in `src/engine.ts` |
+| Golden dataset persistence by task id | ✅ | `saveGoldenDataset` / `loadGoldenDataset` |
+| Hermes-weighted judge (0.5 / 0.3 / 0.2) | ✅ | `evaluateArtifact` in `src/engine.ts` |
+| 7-check constraint validator (non_empty, size, growth, placeholder, heading, frontmatter, drift, skill_structure) | ✅ | `validateConstraints` + `src/constraints-structure.ts` |
+| Execution traces (all + failures) | ✅ | `buildTrace` in `src/engine.ts` |
+| Secret scanner on datasets | ✅ | `scanForSecrets` in `src/engine.ts` |
+| Optional test-command gate | ✅ | `runTestCommand` in `src/engine.ts` |
+| Optional PR automation (branch + `gh pr create`) | ✅ | `createGitBranchWithCandidate` |
+| **Iterative reflective loop** (GEPA-shape) | ✅ | iteration loop in `runTypeScriptEvolution`; `IterationRecord[]` in `iterations/` |
+| **Pi-native executor** (real stdout, not predicted) | ✅ | `src/pi-executor.ts` → `executeCandidateInPi` |
+| **Tiered regression gate** (typecheck → cohort → coherence) | ✅ | `src/tiered-gate.ts` → `runTieredGate` |
+| **SKILL.md structural validator** (name + description in first 500 chars) | ✅ | `src/constraints-structure.ts` |
+| **Cross-run lineage memory** (`lineage.jsonl`, Pareto-best ancestor) | ✅ | `src/lineage.ts` |
+| **TS as default, Python as `--accelerate`** | ✅ | reframed throughout this README and `src/python-backend.ts` |
+| Python DSPy/GEPA acceleration sidecar | 🟦 optional | `python_backend/` |
+| OTel-traced Ralph loop for parity work | 🟦 optional | `scripts/ralph_otel.py` |
+| Sokoban benchmark scaffold | 🟦 optional | `scripts/sokoban_benchmark.py` |
 
-- DSPy-based dataset generation, judging, and candidate synthesis
-- a GEPA optimizer path when the installed DSPy build exposes `dspy.GEPA`
-- automatic degradation to MIPROv2 or plain Chain-of-Thought if GEPA is unavailable
+What is still out of scope versus the full Nous vision:
 
-The TypeScript engine is feature-complete for Phase 1 on its own. Python acceleration is an opt-in layer.
+- Hermes Phases 2–5 (tool-description / system-prompt / tool-implementation-code evolution, continuous auto-improvement loop)
+- code-organism evolution via Darwinian Evolver
+- no built-in pytest gate (use `testCommand` to wire one)
 
-What the latest parity upgrade adds:
-
-- a **three-way dataset split** (train / validation / holdout) in both TypeScript and Python backends
-- **golden dataset support**: when a `goldenTaskId` is provided, the validation split is tagged as a golden set for reproducible cross-run evaluation
-- **traced Ralph loop** (`scripts/ralph_otel.py`) with OpenTelemetry spans for `ralph.run/<task>`, `loop.step`, `model.infer`, `tool`, and `judge`
-- **deterministic repo-deliverable checks** in the judge (execution traces, validation split, golden datasets)
-- a **Sokoban benchmark scaffold** (`scripts/sokoban_benchmark.py`) for initializing repeatable 5-attempt baseline/improvement runs, preparing per-attempt artifacts, recording results, and summarizing held-out performance
-
-What is still missing versus the full Nous vision:
-
-- no automatic pytest / external benchmark gate yet
-- no code-organism evolution
-- still optimized mainly for prompt/instruction artifacts, not general source code
-
-So treat this as a practical **hybrid phase-1 self-evolution package for pi**.
+This package implements **Hermes Phase 1 in TypeScript** as a first-class pi extension.
 
 ## Development
 

@@ -45,7 +45,9 @@
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "python:check": "python -m py_compile python_backend/run_backend.py python_backend/pk_pi_hermes_evolve/backend.py scripts/ralph_otel.py scripts/sokoban_benchmark.py",
     "ralph:parity": "python scripts/ralph_otel.py --task-file scripts/tasks/hermes_parity_task.json --repo . --telemetry-export console",
-    "benchmark:sokoban:help": "python scripts/sokoban_benchmark.py --help"
+    "benchmark:sokoban:help": "python scripts/sokoban_benchmark.py --help",
+    "test:parity": "node --experimental-strip-types -e \"import('./tests/parity.test.ts').then(m => { const r = m.runParityGate(); console.log('parity:', JSON.stringify(r)); }).catch(e => { console.error('FAIL:', e.message); process.exit(1); })\"",
+    "test:gates": "npm run typecheck && npm run python:check && npm run test:parity"
   },
   "publishConfig": {
     "access": "public"
