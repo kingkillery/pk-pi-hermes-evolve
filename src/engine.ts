@@ -526,7 +526,7 @@ async function runTypeScriptEvolution(options: {
     } catch { /* gate unavailable; skip */ }
     const constraintsPass = cr.results.every((r) => r.passed); const composite = evaluation.aggregate.composite; const scoreDelta = composite - priorComposite; const accepted = constraintsPass && scoreDelta > 0 && (testPassed === undefined ? true : testPassed);
     const candidateRecord: CandidateRecord = { ...draft, candidateFullText: fullText, evaluation, executionTraces: cTraces, constraints: cr.results, warnings: cr.warnings, semanticDriftScore: driftScore, testPassed, gateResults };
-    const iterRecord: IterationRecord = { iteration: iter, parentCandidate: parentName, mutationRationale: draft.rationale, reflectionPrompt: reflection, candidate: { name: draft.name, rationale: draft.rationale, candidateBody: draft.candidateBody }, evaluation, traces: cTraces, scoreDelta, accepted };
+    const iterRecord: IterationRecord = { iteration: iter, parentCandidate: parentName, mutationRationale: draft.rationale, reflectionPrompt: reflection, candidate: { name: draft.name, rationale: draft.rationale, candidateBody: draft.candidateBody }, evaluation, traces: cTraces, scoreDelta, accepted, gateResults };
     iterations.push(iterRecord); await safeWriteFile(path.join(runDir, "iterations", `${iter}.json`), JSON.stringify({ ...iterRecord, candidateFullText: fullText, constraints: cr.results, warnings: cr.warnings, semanticDriftScore: driftScore, testPassed, gateResults }, null, 2));
     if (accepted) { candidates.push(candidateRecord); parentName = draft.name; priorComposite = composite; }
     else { options.onProgress?.("iteration", `${iter} rejected: delta=${scoreDelta.toFixed(3)} constraints=${constraintsPass} test=${testPassed ?? "n/a"}`); }
@@ -539,7 +539,7 @@ async function runTypeScriptEvolution(options: {
     const fullText = reassembleArtifact(target.frontmatter, best.candidate.candidateBody);
     const cr = validateConstraints(target, best.candidate.candidateBody, fullText, constraintConfig);
     options.onProgress?.("iterations", `Fallback acceptance: no iteration met strict criteria; promoting "${best.candidate.name}" (composite=${best.evaluation.aggregate.composite.toFixed(3)})`);
-    candidates.push({ ...best.candidate, candidateFullText: fullText, evaluation: best.evaluation, executionTraces: best.traces, constraints: cr.results, warnings: [...cr.warnings, "Fallback acceptance: no iteration met strict acceptance criteria."], semanticDriftScore: undefined, testPassed: undefined, wasFallbackPromoted: true });
+    candidates.push({ ...best.candidate, candidateFullText: fullText, evaluation: best.evaluation, executionTraces: best.traces, constraints: cr.results, warnings: [...cr.warnings, "Fallback acceptance: no iteration met strict acceptance criteria."], semanticDriftScore: undefined, testPassed: undefined, wasFallbackPromoted: true, gateResults: best.gateResults });
   }
   candidates.sort((a, b) => b.evaluation.aggregate.composite - a.evaluation.aggregate.composite);
   const bestCandidate = candidates[0]!;

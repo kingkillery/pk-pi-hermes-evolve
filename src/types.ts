@@ -236,6 +236,7 @@ export interface IterationRecord {
   traces: ExecutionTrace[];
   scoreDelta: number;
   accepted: boolean;
+  gateResults?: TieredGateResult[];
 }
 
 export interface ExecutionObservation {
