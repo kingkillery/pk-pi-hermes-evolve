@@ -1,0 +1,169 @@
+{
+  "dataset": {
+    "default": {
+      "examples": [
+        {
+          "taskInput": "Explain when an agent should invoke the smoke-skill artifact.",
+          "expectedBehavior": "The agent describes that smoke-skill is a synthetic fixture for the self-evolution engine and is not for production use.",
+          "difficulty": "easy",
+          "category": "scope",
+          "source": "synthetic"
+        },
+        {
+          "taskInput": "List the three constraints the smoke-skill body intentionally exercises.",
+          "expectedBehavior": "Names placeholder preservation, top-heading preservation, and growth/size limits.",
+          "difficulty": "medium",
+          "category": "constraints",
+          "source": "synthetic"
+        },
+        {
+          "taskInput": "What placeholder must be preserved when mutating the smoke-skill body?",
+          "expectedBehavior": "Identifies the literal token {{ITERATION_NAME}} and states it must appear in any candidate body.",
+          "difficulty": "easy",
+          "category": "placeholder",
+          "source": "synthetic"
+        },
+        {
+          "taskInput": "Describe one failure mode the mock driver elicits on purpose.",
+          "expectedBehavior": "Names at least one of: typecheck-tier failure, cohort-tier regression, coherence-tier failure.",
+          "difficulty": "hard",
+          "category": "failure-mode",
+          "source": "synthetic"
+        }
+      ]
+    }
+  },
+  "judge": {
+    "default": [
+      {
+        "responsePreview": "Baseline run: artifact body is small, deterministic, and used for smoke-only purposes.",
+        "correctness": 0.55,
+        "procedureFollowing": 0.55,
+        "conciseness": 0.6,
+        "feedback": "Baseline answer is plausible but does not explicitly cite the synthetic nature.",
+        "confidence": 0.7
+      },
+      {
+        "responsePreview": "Iter 1 candidate: clearer scoping, names the engine and placeholder.",
+        "correctness": 0.7,
+        "procedureFollowing": 0.7,
+        "conciseness": 0.7,
+        "feedback": "Iter 1 candidate improves correctness by explicitly naming the engine and placeholder.",
+        "confidence": 0.78
+      },
+      {
+        "responsePreview": "Iter 2 candidate: names all three constraints exercised by the fixture.",
+        "correctness": 0.82,
+        "procedureFollowing": 0.82,
+        "conciseness": 0.78,
+        "feedback": "Iter 2 candidate completes the constraint inventory and stays concise.",
+        "confidence": 0.84
+      }
+    ],
+    "force-typecheck-fail": [
+      {
+        "responsePreview": "Forced-fail baseline.",
+        "correctness": 0.6,
+        "procedureFollowing": 0.6,
+        "conciseness": 0.6,
+        "feedback": "Forced-fail baseline.",
+        "confidence": 0.7
+      }
+    ],
+    "force-cohort-fail": [
+      {
+        "responsePreview": "Forced-cohort baseline.",
+        "correctness": 0.6,
+        "procedureFollowing": 0.6,
+        "conciseness": 0.6,
+        "feedback": "Forced-cohort baseline.",
+        "confidence": 0.7
+      },
+      {
+        "responsePreview": "Cohort-regressed candidate: scores tank vs. baseline.",
+        "correctness": 0.25,
+        "procedureFollowing": 0.25,
+        "conciseness": 0.4,
+        "feedback": "Cohort-regressed candidate drops correctness sharply.",
+        "confidence": 0.7
+      }
+    ],
+    "force-coherence-fail": [
+      {
+        "responsePreview": "Forced-coherence baseline.",
+        "correctness": 0.6,
+        "procedureFollowing": 0.6,
+        "conciseness": 0.6,
+        "feedback": "Forced-coherence baseline.",
+        "confidence": 0.7
+      },
+      {
+        "responsePreview": "Coherence-failure candidate: still scores well but coherence check tripped.",
+        "correctness": 0.72,
+        "procedureFollowing": 0.72,
+        "conciseness": 0.72,
+        "feedback": "Candidate body diverges from sibling skills in tone and will fail external coherence check.",
+        "confidence": 0.8
+      }
+    ]
+  },
+  "candidate": {
+    "default": [
+      {
+        "name": "iter-1-clarify-scope",
+        "rationale": "Iter 1 mutation: clarify that the smoke fixture is synthetic and name the engine + placeholder explicitly.",
+        "candidateBody": "# Smoke Skill\n\nThis skill is the runtime smoke fixture for the Hermes self-evolution engine.\nIt is synthetic and deterministic so verifier lanes can assert stable outcomes.\n\n## When to use\n\nUse this skill only as a target artifact for the engine. Never load it into a\nproduction agent runtime.\n\n## How it works\n\n1. The engine reads this file as the input artifact.\n2. Mock LLM responses mutate the body while preserving {{ITERATION_NAME}}.\n3. Judge mocks return deterministic scores so the iterative loop picks a winner.\n\n## Operating notes\n\n- Preserve the {{ITERATION_NAME}} placeholder.\n- Keep the top-level # Smoke Skill heading.\n- Stay under the growth ceiling.\n- Current iteration label: {{ITERATION_NAME}}"
+      },
+      {
+        "name": "iter-2-name-constraints",
+        "rationale": "Iter 2 mutation: add an explicit inventory of the three constraints the body exercises.",
+        "candidateBody": "# Smoke Skill\n\nThis skill is the runtime smoke fixture for the Hermes self-evolution engine.\nIt is synthetic, small, and deterministic.\n\n## When to use\n\nUse only as a target artifact for the engine. Never load into a production runtime.\n\n## Constraints exercised\n\n1. Placeholder preservation: {{ITERATION_NAME}} must survive every mutation.\n2. Top-heading preservation: the # Smoke Skill heading must remain.\n3. Growth limit: candidate body stays under 1.2x of the original.\n\n## Operating notes\n\n- Iteration label: {{ITERATION_NAME}}\n- Do not exceed the byte budget enforced by the engine."
+      }
+    ],
+    "force-typecheck-fail": [
+      {
+        "name": "iter-1-typecheck-fail",
+        "rationale": "Force-typecheck variant: candidate is valid markdown; smoke driver synthesizes a typecheck_failed gate result post-run.",
+        "candidateBody": "# Smoke Skill\n\nForced-typecheck-failure variant.\n\n## Notes\n\n- Iteration: {{ITERATION_NAME}}\n- Driver will overwrite the typecheck tier reasonCode to `typecheck_failed`."
+      }
+    ],
+    "force-cohort-fail": [
+      {
+        "name": "iter-1-cohort-fail",
+        "rationale": "Force-cohort variant: judge mock returns regressed scores; smoke driver synthesizes a cohort_regression gate result.",
+        "candidateBody": "# Smoke Skill\n\nForced-cohort-regression variant.\n\n## Notes\n\n- Iteration: {{ITERATION_NAME}}\n- Body intentionally minimal so the judge can score it down."
+      }
+    ],
+    "force-coherence-fail": [
+      {
+        "name": "iter-1-coherence-fail",
+        "rationale": "Force-coherence variant: body would pass typecheck and cohort; smoke driver synthesizes a coherence_failed gate result to simulate a wired coherenceCheck callback.",
+        "candidateBody": "# Smoke Skill\n\nForced-coherence-failure variant.\n\n## Notes\n\n- Iteration: {{ITERATION_NAME}}\n- Driver will inject a coherence_failed TieredGateResult after the engine writes iterations/1.json."
+      }
+    ]
+  },
+  "drift": {
+    "default": {
+      "driftScore": 0.15,
+      "feedback": "Low drift: candidate preserves intent, placeholder, and structure."
+    },
+    "force-typecheck-fail": {
+      "driftScore": 0.15,
+      "feedback": "Low drift in forced-typecheck mode."
+    },
+    "force-cohort-fail": {
+      "driftScore": 0.15,
+      "feedback": "Low drift in forced-cohort mode."
+    },
+    "force-coherence-fail": {
+      "driftScore": 0.15,
+      "feedback": "Low drift in forced-coherence mode."
+    }
+  },
+  "executor": {
+    "default": "MOCK_EXECUTOR_STDOUT: smoke-skill responded with deterministic preview text for iteration {{counter}}.",
+    "force-typecheck-fail": "MOCK_EXECUTOR_STDOUT: forced-typecheck variant for iteration {{counter}}.",
+    "force-cohort-fail": "MOCK_EXECUTOR_STDOUT: forced-cohort variant for iteration {{counter}}.",
+    "force-coherence-fail": "MOCK_EXECUTOR_STDOUT: forced-coherence variant for iteration {{counter}}."
+  }
+}
