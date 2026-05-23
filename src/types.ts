@@ -88,7 +88,8 @@ export type ConstraintName =
   | "placeholder_preservation"
   | "top_heading_preservation"
   | "frontmatter_preservation"
-  | "semantic_drift";
+  | "semantic_drift"
+  | "skill_structure";
 
 export interface ConstraintResult {
   name: ConstraintName;
@@ -140,6 +141,15 @@ export interface CandidateRecord extends CandidateDraft {
   warnings: string[];
   semanticDriftScore?: number;
   testPassed?: boolean;
+  executionObservation?: ExecutionObservation;
+  gateResults?: TieredGateResult[];
+  /**
+   * True when this candidate was promoted by the engine's fallback acceptance
+   * path because no iteration met the strict score-delta + constraints gate.
+   * Surfaced in manifest.json#bestCandidate so downstream tools can detect
+   * degenerate "winner" promotion without spelunking `warnings`.
+   */
+  wasFallbackPromoted?: boolean;
 }
 
 export interface EvolutionOptions {
@@ -157,6 +167,16 @@ export interface EvolutionOptions {
   testTimeout?: number;
   createPR?: boolean;
   persistGolden?: boolean;
+  /** Deterministic seed for splitExamples and any future RNG consumers. When unset, falls back to unseeded Math.random. */
+  seed?: number;
+  /** Cohort of EvalExamples used by the tiered gate's cohort-regression tier. */
+  cohortExamples?: EvalExample[];
+  /** Judge callback invoked by the tiered gate to score the cohort. Required when cohortExamples is supplied. */
+  cohortJudgeFunc?: (examples: EvalExample[]) => Promise<{ composite: number }>;
+  /** Coherence check callback invoked by the tiered gate's coherence tier. */
+  coherenceCheck?: () => Promise<{ passed: boolean; detail: string }>;
+  /** Override the tsconfig path the tiered-gate typecheck tier runs against. Useful for forcing typecheck-tier failure in test scenarios. */
+  tsConfigPath?: string;
 }
 
 export interface EvolutionPaths {
@@ -196,7 +216,65 @@ export interface EvolutionRunResult {
   maxBytes: number;
   baselineTraces: ExecutionTrace[];
   prResult?: PRAutomationResult;
+  iterations?: IterationRecord[];
 }
+
+export interface ReflectionPrompt {
+  priorTraces: ExecutionTrace[];
+  priorJudgeFeedback: string[];
+  objective: string;
+  weaknessSummary: string;
+}
+
+export interface IterationRecord {
+  iteration: number;
+  parentCandidate?: string;
+  mutationRationale: string;
+  reflectionPrompt: ReflectionPrompt;
+  candidate: CandidateDraft;
+  evaluation: ArtifactEvaluation;
+  traces: ExecutionTrace[];
+  scoreDelta: number;
+  accepted: boolean;
+  gateResults?: TieredGateResult[];
+}
+
+export interface ExecutionObservation {
+  stdout: string;
+  stderr: string;
+  exitCode: number;
+  durationMs: number;
+  capturedFiles?: Record<string, string>;
+}
+
+export interface TieredGateResult {
+  tier: "typecheck" | "cohort" | "coherence";
+  passed: boolean;
+  reasonCode: string;
+  detail: string;
+  durationMs: number;
+}
+
+export interface LineageEntry {
+  runId: string;
+  parentRunId?: string;
+  artifactHash: string;
+  parentArtifactHash?: string;
+  score: number;
+  mutationRationale: string;
+  createdAt: string;
+}
+
+export interface SkillStructureReport {
+  hasFrontmatter: boolean;
+  hasName: boolean;
+  hasDescription: boolean;
+  nameInFirst500: boolean;
+  descriptionInFirst500: boolean;
+  errors: string[];
+}
+
+export type BackendMode = "typescript" | "python-accelerate";
 
 export type EvolutionSummaryDetails = ToolSummaryDetails;
 

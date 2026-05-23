@@ -5,6 +5,10 @@ import path from "node:path";
 import { withFileMutationQueue } from "@mariozechner/pi-coding-agent";
 import { detectPythonBackend, runPythonBackend } from "./python-backend.js";
 import { mineSessionSnippets } from "./session-history.js";
+import { executeCandidateInPi } from "./pi-executor.js";
+import { runTieredGate } from "./tiered-gate.js";
+import { checkSkillStructure } from "./constraints-structure.js";
+import { appendLineageEntry, loadBestAncestor } from "./lineage.js";
 import type {
   AggregateScore,
   ArtifactEvaluation,
@@ -19,13 +23,18 @@ import type {
   EvolutionOptions,
   EvolutionRunResult,
   EvolutionSummaryDetails,
+  ExecutionObservation,
   ExecutionTrace,
   ExampleEvaluation,
   GoldenDataset,
   GoldenDatasetManifest,
+  IterationRecord,
   JudgeResult,
+  LineageEntry,
   PRAutomationResult,
+  ReflectionPrompt,
   SecretScanResult,
+  TieredGateResult,
   ToolSummaryDetails,
 } from "./types.js";
 
@@ -235,6 +244,7 @@ function validateConstraints(target: ArtifactTarget, candidateBody: string, cand
   else results.push({ name: "placeholder_preservation" as ConstraintName, passed: true, message: `All ${target.placeholders.length} preserved.` });
   if (target.topHeading && !nb.match(/^#\s+.+$/m)) { results.push({ name: "top_heading_preservation" as ConstraintName, passed: false, message: "Lost top heading." }); warnings.push("Candidate lost the top-level markdown heading."); }
   if (target.frontmatter) { const cfm = splitFrontmatter(candidateFullText).frontmatter; if (cfm !== target.frontmatter) results.push({ name: "frontmatter_preservation" as ConstraintName, passed: false, message: "Frontmatter modified." }); }
+  if (target.type === "skill") { try { const sr = checkSkillStructure(candidateFullText) as ConstraintResult; if (sr) results.push({ name: "skill_structure" as ConstraintName, passed: !!sr.passed, message: String(sr.message ?? ""), details: sr.details }); } catch { /* sibling module may not be available yet */ } }
   if (nb === target.body.trim()) warnings.push("Candidate identical to baseline.");
   return { results, valid: results.every((r) => r.passed), warnings };
 }
@@ -294,8 +304,20 @@ function normalizeExamples(payload: unknown, evalSource: EvalSource): EvalExampl
   }).filter((item): item is EvalExample => Boolean(item));
 }
 
-function splitExamples(examples: EvalExample[]): { train: EvalExample[]; validation: EvalExample[]; holdout: EvalExample[] } {
-  const s = [...examples]; for (let i = s.length - 1; i > 0; i -= 1) { const j = Math.floor(Math.random() * (i + 1)); [s[i], s[j]] = [s[j]!, s[i]!]; }
+function mulberry32(seed: number): () => number {
+  let s = seed >>> 0;
+  return () => {
+    s = (s + 0x6d2b79f5) >>> 0;
+    let t = s;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function splitExamples(examples: EvalExample[], seed?: number): { train: EvalExample[]; validation: EvalExample[]; holdout: EvalExample[] } {
+  const rng = seed !== undefined ? mulberry32(seed) : Math.random;
+  const s = [...examples]; for (let i = s.length - 1; i > 0; i -= 1) { const j = Math.floor(rng() * (i + 1)); [s[i], s[j]] = [s[j]!, s[i]!]; }
   const tc = Math.max(3, Math.ceil(s.length * 0.5)); const vc = Math.max(1, Math.floor(s.length * 0.2));
   const train = s.slice(0, tc); const validation = s.slice(tc, tc + vc); const holdout = s.slice(tc + vc);
   if (holdout.length === 0 && train.length > 2) holdout.push(train.pop()!);
@@ -321,21 +343,32 @@ function buildTrace(artifactText: string, example: EvalExample, judged: JudgeRes
   return { traceId: traceId(), artifactText: artifactText.slice(0, 2000), taskInput: example.taskInput, expectedBehavior: example.expectedBehavior, rawOutput: rawOutput.slice(0, 2000), responsePreview: judged.responsePreview.slice(0, 500), scores: { correctness: judged.correctness, procedureFollowing: judged.procedureFollowing, conciseness: judged.conciseness, composite }, feedback: judged.feedback, isFailure: composite < 0.5, timestamp: new Date().toISOString() };
 }
 
-async function evaluateArtifact(options: { cwd: string; model?: string; thinkingLevel?: string; target: ArtifactTarget; artifactText: string; objective: string; examples: EvalExample[]; maxBytes: number; signal?: AbortSignal; onProgress?: (detail: string) => void }): Promise<{ evaluation: ArtifactEvaluation; traces: ExecutionTrace[] }> {
-  const evals: ExampleEvaluation[] = []; const traces: ExecutionTrace[] = [];
+async function evaluateArtifact(options: { cwd: string; model?: string; thinkingLevel?: string; target: ArtifactTarget; artifactText: string; objective: string; examples: EvalExample[]; maxBytes: number; signal?: AbortSignal; onProgress?: (detail: string) => void; useRealExecutor?: boolean; executorLogDir?: string; artifactName?: string }): Promise<{ evaluation: ArtifactEvaluation; traces: ExecutionTrace[]; executorObservations?: ExecutionObservation[] }> {
+  const evals: ExampleEvaluation[] = []; const traces: ExecutionTrace[] = []; const observations: ExecutionObservation[] = [];
   const rubricHint = RUBRIC_PRESETS[options.target.type] ?? "";
   for (let i = 0; i < options.examples.length; i += 1) {
     const ex = options.examples[i]!; options.onProgress?.(`Judging ${i + 1}/${options.examples.length}`);
+    let executorContext = ""; let observation: ExecutionObservation | undefined;
+    if (options.useRealExecutor) {
+      try {
+        observation = await executeCandidateInPi({ cwd: options.cwd, candidateFullText: options.artifactText, taskInput: ex.taskInput, artifactName: options.artifactName || slugify(options.target.name) || "candidate", model: options.model, thinkingLevel: options.thinkingLevel, signal: options.signal });
+        observations.push(observation);
+        executorContext = ["", "Observed agent stdout (actual pi run):", "```", observation.stdout.slice(0, 4000), "```", `Exit code: ${observation.exitCode}; duration: ${observation.durationMs}ms.`].join("\n");
+        if (options.executorLogDir) { const dir = path.join(options.executorLogDir, String(i)); await safeWriteFile(path.join(dir, "stdout.log"), observation.stdout); await safeWriteFile(path.join(dir, "stderr.log"), observation.stderr); await safeWriteFile(path.join(dir, "meta.json"), JSON.stringify({ exitCode: observation.exitCode, durationMs: observation.durationMs, taskInput: ex.taskInput }, null, 2)); }
+      } catch (err) { executorContext = `\nExecutor unavailable: ${err instanceof Error ? err.message : String(err)}`; }
+    }
     const rubricLine = rubricHint ? `Rubric guidance: ${rubricHint}` : "";
-    const prompt = [`Artifact type: ${options.target.type}`, `Objective: ${options.objective}`, `Path: ${options.target.path}`, rubricLine, "", "Artifact text:", "```", options.artifactText.trim(), "```", "", `Task: ${ex.taskInput}`, `Rubric: ${ex.expectedBehavior}`, `Difficulty: ${ex.difficulty}`, `Category: ${ex.category}`, "", 'Return JSON: {"responsePreview":"...","correctness":0.0,"procedureFollowing":0.0,"conciseness":0.0,"feedback":"...","confidence":0.0}'].filter(Boolean).join("\n");
+    const prompt = [`Artifact type: ${options.target.type}`, `Objective: ${options.objective}`, `Path: ${options.target.path}`, rubricLine, "", "Artifact text:", "```", options.artifactText.trim(), "```", "", `Task: ${ex.taskInput}`, `Rubric: ${ex.expectedBehavior}`, `Difficulty: ${ex.difficulty}`, `Category: ${ex.category}`, executorContext, "", 'Return JSON: {"responsePreview":"...","correctness":0.0,"procedureFollowing":0.0,"conciseness":0.0,"feedback":"...","confidence":0.0}'].filter(Boolean).join("\n");
     const raw = await runPiTextTask({ cwd: options.cwd, model: options.model, thinkingLevel: options.thinkingLevel, systemPrompt: JUDGE_SYSTEM_PROMPT, prompt, signal: options.signal });
-    const j = normalizeJudgeResult(extractJsonPayload(raw)); const c = 0.5 * j.correctness + 0.3 * j.procedureFollowing + 0.2 * j.conciseness;
-    evals.push({ example: ex, composite: c, ...j }); traces.push(buildTrace(options.artifactText, ex, j, c, raw));
+    const j = normalizeJudgeResult(extractJsonPayload(raw));
+    if (observation && !j.responsePreview) j.responsePreview = observation.stdout.slice(0, 500);
+    const c = 0.5 * j.correctness + 0.3 * j.procedureFollowing + 0.2 * j.conciseness;
+    evals.push({ example: ex, composite: c, ...j }); traces.push(buildTrace(options.artifactText, ex, j, c, observation ? observation.stdout : raw));
   }
   const n = Math.max(1, evals.length);
   const raw: AggregateScore = { correctness: evals.reduce((s, e) => s + e.correctness, 0) / n, procedureFollowing: evals.reduce((s, e) => s + e.procedureFollowing, 0) / n, conciseness: evals.reduce((s, e) => s + e.conciseness, 0) / n, confidence: evals.reduce((s, e) => s + e.confidence, 0) / n, lengthPenalty: 0, composite: evals.reduce((s, e) => s + e.composite, 0) / n };
   const sr = Buffer.byteLength(options.artifactText, "utf8") / Math.max(1, options.maxBytes); const lp = sr > 0.9 ? Math.min(0.3, (sr - 0.9) * 3) : 0;
-  return { evaluation: { aggregate: { ...raw, lengthPenalty: lp, composite: Math.max(0, raw.composite - lp) }, examples: evals }, traces };
+  return { evaluation: { aggregate: { ...raw, lengthPenalty: lp, composite: Math.max(0, raw.composite - lp) }, examples: evals }, traces, executorObservations: observations.length > 0 ? observations : undefined };
 }
 
 async function generateDataset(options: { cwd: string; model?: string; thinkingLevel?: string; target: ArtifactTarget; objective: string; evalSource: EvalSource; maxExamples: number; sessionQuery?: string; signal?: AbortSignal; onProgress?: (detail: string) => void }): Promise<{ examples: EvalExample[]; sessionSnippets: ReturnType<typeof mineSessionSnippets> }> {
@@ -350,22 +383,26 @@ async function generateDataset(options: { cwd: string; model?: string; thinkingL
   return { examples, sessionSnippets: snippets };
 }
 
-async function generateCandidates(options: { cwd: string; model?: string; thinkingLevel?: string; target: ArtifactTarget; objective: string; trainExamples: EvalExample[]; baselineTrain: ArtifactEvaluation; baselineTraces: ExecutionTrace[]; maxBytes: number; candidateCount: number; signal?: AbortSignal }): Promise<CandidateDraft[]> {
-  const failures = options.baselineTraces.filter((t) => t.isFailure);
-  const traceSection = failures.length > 0 ? ["", "Observed failure traces:", ...failures.slice(0, 5).map((t, i) => `  ${i + 1}. Task: ${t.taskInput}\n     Scores: correctness=${t.scores.correctness.toFixed(2)}, procedure=${t.scores.procedureFollowing.toFixed(2)}, composite=${t.scores.composite.toFixed(2)}\n     Feedback: ${t.feedback}`)].join("\n") : "";
-  const prompt = [`Artifact type: ${options.target.type}`, `Path: ${options.target.path}`, `Objective: ${options.objective}`, `Max bytes: ${options.maxBytes}`, `Placeholders: ${options.target.placeholders.length > 0 ? options.target.placeholders.join(", ") : "none"}`, `Top heading: ${options.target.topHeading ?? "none"}`, "", "Original BODY:", "```", options.target.body.trim(), "```", "", "Training tasks:", options.trainExamples.map((e, i) => `${i + 1}. ${e.taskInput}\n   Rubric: ${e.expectedBehavior}`).join("\n\n"), "", "Weaknesses:", summarizeWeaknesses(options.baselineTrain, 3), traceSection, "", 'Return JSON: {"candidates":[{"name":"short-kebab","rationale":"paragraph","candidateBody":"full revised body"}]}', "", `Generate ${options.candidateCount} DISTINCT candidates.`, "Rules: use failure traces for TARGETED fixes, preserve placeholders, keep markdown valid, never mention evaluation/scores."].join("\n");
+function buildReflectionPrompt(objective: string, priorTraces: ExecutionTrace[], priorEvaluation: ArtifactEvaluation): ReflectionPrompt {
+  const judgeFeedback = priorTraces.map((t) => t.feedback).filter(Boolean).slice(0, 8);
+  return { priorTraces, priorJudgeFeedback: judgeFeedback, objective, weaknessSummary: summarizeWeaknesses(priorEvaluation, 3) };
+}
+
+async function generateOneCandidateDraft(options: { cwd: string; model?: string; thinkingLevel?: string; target: ArtifactTarget; objective: string; trainExamples: EvalExample[]; reflection: ReflectionPrompt; maxBytes: number; iteration: number; parentName?: string; signal?: AbortSignal }): Promise<CandidateDraft> {
+  const failures = options.reflection.priorTraces.filter((t) => t.isFailure);
+  const traceSection = failures.length > 0 ? ["", "Observed failure traces (prior iteration):", ...failures.slice(0, 5).map((t, i) => `  ${i + 1}. Task: ${t.taskInput}\n     Scores: correctness=${t.scores.correctness.toFixed(2)}, procedure=${t.scores.procedureFollowing.toFixed(2)}, composite=${t.scores.composite.toFixed(2)}\n     Feedback: ${t.feedback}`)].join("\n") : "";
+  const feedbackSection = options.reflection.priorJudgeFeedback.length > 0 ? ["", "Prior judge feedback to address:", ...options.reflection.priorJudgeFeedback.slice(0, 6).map((f, i) => `  ${i + 1}. ${f}`)].join("\n") : "";
+  const parentSection = options.parentName ? `\nParent candidate: ${options.parentName} (mutate; do not regress its gains).` : "\nParent candidate: <baseline>";
+  const prompt = [`Iteration: ${options.iteration}`, `Artifact type: ${options.target.type}`, `Path: ${options.target.path}`, `Objective: ${options.objective}`, `Max bytes: ${options.maxBytes}`, `Placeholders: ${options.target.placeholders.length > 0 ? options.target.placeholders.join(", ") : "none"}`, `Top heading: ${options.target.topHeading ?? "none"}`, parentSection, "", "Original BODY:", "```", options.target.body.trim(), "```", "", "Training tasks:", options.trainExamples.map((e, i) => `${i + 1}. ${e.taskInput}\n   Rubric: ${e.expectedBehavior}`).join("\n\n"), "", "Weaknesses (prior):", options.reflection.weaknessSummary, traceSection, feedbackSection, "", 'Return JSON: {"name":"short-kebab","rationale":"paragraph explaining mutation","candidateBody":"full revised body"}', "", "Rules: produce ONE revision that targets the prior failure traces and judge feedback, preserve placeholders, keep markdown valid, never mention evaluation/scores."].join("\n");
   const raw = await runPiTextTask({ cwd: options.cwd, model: options.model, thinkingLevel: options.thinkingLevel, systemPrompt: CANDIDATE_SYSTEM_PROMPT, prompt, signal: options.signal });
-  const payload = extractJsonPayload(raw) as { candidates?: unknown } | unknown[];
-  const rawC = Array.isArray(payload) ? payload : Array.isArray(payload.candidates) ? payload.candidates : [];
-  const seen = new Set<string>(); const drafts: CandidateDraft[] = [];
-  for (const item of rawC) {
-    if (!item || typeof item !== "object") continue; const r = item as Record<string, unknown>;
-    let cb = String(r.candidateBody ?? r.candidate_body ?? "").trim(); if (!cb) continue;
-    if (cb.startsWith("---")) cb = splitFrontmatter(cb).body; if (seen.has(cb)) continue; seen.add(cb);
-    drafts.push({ name: slugify(String(r.name ?? `candidate-${drafts.length + 1}`)) || `candidate-${drafts.length + 1}`, rationale: String(r.rationale ?? "").trim() || "No rationale.", candidateBody: cb });
-  }
-  if (drafts.length === 0) throw new Error("Candidate generation returned no usable revisions.");
-  return drafts.slice(0, options.candidateCount);
+  const payload = extractJsonPayload(raw) as Record<string, unknown> | unknown[];
+  let r: Record<string, unknown> = {};
+  if (Array.isArray(payload)) r = (payload[0] as Record<string, unknown>) ?? {};
+  else { const p = payload as Record<string, unknown>; if (Array.isArray(p.candidates) && p.candidates.length > 0) r = (p.candidates[0] as Record<string, unknown>) ?? {}; else r = p; }
+  let cb = String(r.candidateBody ?? r.candidate_body ?? "").trim();
+  if (!cb) throw new Error(`Iteration ${options.iteration}: model returned no candidateBody.`);
+  if (cb.startsWith("---")) cb = splitFrontmatter(cb).body;
+  return { name: slugify(String(r.name ?? `iter-${options.iteration}`)) || `iter-${options.iteration}`, rationale: String(r.rationale ?? "").trim() || `Iteration ${options.iteration} mutation.`, candidateBody: cb };
 }
 
 async function safeWriteFile(filePath: string, content: string): Promise<void> { await fs.mkdir(path.dirname(filePath), { recursive: true }); await withFileMutationQueue(filePath, async () => { await fs.writeFile(filePath, content, "utf8"); }); }
@@ -511,6 +548,10 @@ async function runTypeScriptEvolution(options: {
   cwd: string; targetPath: string; objective: string; evalSource: EvalSource; model?: string; thinkingLevel?: string;
   candidateCount: number; maxExamples: number; sessionQuery?: string; goldenTaskId?: string;
   testCommand?: string; testTimeout?: number; createPR?: boolean; persistGolden?: boolean;
+  seed?: number; cohortExamples?: EvalExample[];
+  cohortJudgeFunc?: (examples: EvalExample[]) => Promise<{ composite: number }>;
+  coherenceCheck?: () => Promise<{ passed: boolean; detail: string }>;
+  tsConfigPath?: string;
   signal?: AbortSignal; onProgress?: (phase: string, detail?: string) => void;
 }): Promise<EvolutionRunResult> {
   const target = await resolveArtifactTarget(options.targetPath, options.cwd);
@@ -529,7 +570,7 @@ async function runTypeScriptEvolution(options: {
   if (!usedPersistedGolden) {
     options.onProgress?.("dataset", "Generating evaluation set");
     const ds = await generateDataset({ cwd: options.cwd, model: options.model, thinkingLevel: options.thinkingLevel, target, objective: options.objective, evalSource: options.evalSource, maxExamples: Math.max(4, options.maxExamples), sessionQuery: options.sessionQuery, signal: options.signal, onProgress: (d) => options.onProgress?.("dataset", d) });
-    const splits = splitExamples(ds.examples); train = splits.train; validation = splits.validation; holdout = splits.holdout; sessionSnippets = ds.sessionSnippets;
+    const splits = splitExamples(ds.examples, options.seed); train = splits.train; validation = splits.validation; holdout = splits.holdout; sessionSnippets = ds.sessionSnippets;
   }
   const golden = buildGoldenDataset(validation, options.goldenTaskId);
   if (golden && options.persistGolden !== false && !usedPersistedGolden) await saveGoldenDataset(options.cwd, golden, train, validation, holdout, target.path, target.name);
@@ -540,19 +581,26 @@ async function runTypeScriptEvolution(options: {
   options.onProgress?.("baseline", "Validation"); const { evaluation: baselineValidation } = await evaluateArtifact({ cwd: options.cwd, model: options.model, thinkingLevel: options.thinkingLevel, target, artifactText: target.fullText, objective: options.objective, examples: validation, maxBytes, signal: options.signal });
   const baselineTraces = [...btt];
 
-  // Candidates with trace-informed mutation
-  options.onProgress?.("candidates", `Generating ${options.candidateCount} candidate(s)`);
-  const drafts = await generateCandidates({ cwd: options.cwd, model: options.model, thinkingLevel: options.thinkingLevel, target, objective: options.objective, trainExamples: train, baselineTrain, baselineTraces, maxBytes, candidateCount: options.candidateCount, signal: options.signal });
+  // Lineage: try to find best ancestor for this artifact path
+  let ancestor: Awaited<ReturnType<typeof loadBestAncestor>> | undefined;
+  try { ancestor = await loadBestAncestor(options.cwd, target.path); if (ancestor) options.onProgress?.("lineage", `ancestor_id=${(ancestor as LineageEntry).runId ?? "unknown"} score=${((ancestor as LineageEntry).score ?? 0).toFixed(3)}`); } catch { /* sibling module unavailable */ }
 
-  const candidates: CandidateRecord[] = [];
-  for (let i = 0; i < drafts.length; i += 1) {
-    const draft = drafts[i]!;
+  // Iterative reflective loop (Hermes-style): single candidate per iteration, reflection from prior traces.
+  const iterationCount = Math.min(5, Math.max(1, options.candidateCount || 3));
+  options.onProgress?.("iterations", `Running ${iterationCount} reflective iteration(s)`);
+  const iterations: IterationRecord[] = []; const candidates: CandidateRecord[] = [];
+  let priorTraces: ExecutionTrace[] = baselineTraces; let priorEvaluation: ArtifactEvaluation = baselineTrain; let parentName: string | undefined; let priorComposite = baselineValidation.aggregate.composite;
+  for (let iter = 1; iter <= iterationCount; iter += 1) {
+    options.onProgress?.("iteration", `${iter}/${iterationCount} reflect+mutate`);
+    const reflection = buildReflectionPrompt(options.objective, priorTraces, priorEvaluation);
+    let draft: CandidateDraft;
+    try { draft = await generateOneCandidateDraft({ cwd: options.cwd, model: options.model, thinkingLevel: options.thinkingLevel, target, objective: options.objective, trainExamples: train, reflection, maxBytes, iteration: iter, parentName, signal: options.signal }); }
+    catch (err) { options.onProgress?.("iteration", `${iter} skipped: ${err instanceof Error ? err.message : String(err)}`); continue; }
     const fullText = reassembleArtifact(target.frontmatter, draft.candidateBody);
     const cr = validateConstraints(target, draft.candidateBody, fullText, constraintConfig);
-    if (!cr.valid) continue;
-    options.onProgress?.("judge", `Candidate ${i + 1}/${drafts.length}: ${draft.name} on validation`);
-    const { evaluation, traces: cTraces } = await evaluateArtifact({ cwd: options.cwd, model: options.model, thinkingLevel: options.thinkingLevel, target, artifactText: fullText, objective: options.objective, examples: validation, maxBytes, signal: options.signal });
-
+    options.onProgress?.("iteration", `${iter} judge on validation`);
+    const execLogDir = path.join(runDir, "executor", String(iter));
+    const { evaluation, traces: cTraces } = await evaluateArtifact({ cwd: options.cwd, model: options.model, thinkingLevel: options.thinkingLevel, target, artifactText: fullText, objective: options.objective, examples: validation, maxBytes, signal: options.signal, useRealExecutor: true, executorLogDir: execLogDir, artifactName: draft.name });
     // Drift
     let driftScore: number | undefined;
     if (constraintConfig.checkSemanticDrift) {
@@ -560,22 +608,47 @@ async function runTypeScriptEvolution(options: {
       const d = await computeSemanticDrift(options.cwd, target.body, draft.candidateBody, options.objective, options.model, options.thinkingLevel, options.signal);
       driftScore = d.score;
       cr.results.push({ name: "semantic_drift" as ConstraintName, passed: d.score <= constraintConfig.maxDriftScore, message: `Drift: ${d.score.toFixed(3)} (max ${constraintConfig.maxDriftScore}). ${d.feedback}` });
-      if (d.score > constraintConfig.maxDriftScore) { cr.warnings.push(`Semantic drift too high: ${d.score.toFixed(3)}`); continue; }
+      if (d.score > constraintConfig.maxDriftScore) cr.warnings.push(`Semantic drift too high: ${d.score.toFixed(3)}`);
     }
-
     // Test gate
     let testPassed: boolean | undefined;
     if (options.testCommand) {
       options.onProgress?.("test", draft.name);
       await safeWriteFile(target.path, fullText); const tr = await runTestCommand(options.testCommand, options.cwd, constraintConfig.testTimeoutMs, options.signal);
       testPassed = tr.passed; await safeWriteFile(target.path, target.fullText);
-      if (!tr.passed) { cr.warnings.push(`Test failed (exit ${tr.exitCode})`); continue; }
+      if (!tr.passed) cr.warnings.push(`Test failed (exit ${tr.exitCode})`);
     }
-
-    candidates.push({ ...draft, candidateFullText: fullText, evaluation, executionTraces: cTraces, constraints: cr.results, warnings: cr.warnings, semanticDriftScore: driftScore, testPassed });
+    // Tiered gate: real callbacks threaded from EvolutionOptions; skip-codes still apply when callbacks are unset.
+    let gateResults: TieredGateResult[] | undefined;
+    try {
+      gateResults = await runTieredGate({
+        cwd: options.cwd,
+        candidateText: fullText,
+        signal: options.signal,
+        cohortExamples: options.cohortExamples,
+        judgeFunc: options.cohortJudgeFunc,
+        coherenceCheck: options.coherenceCheck,
+        tsConfigPath: options.tsConfigPath,
+        baselineScore: baselineHoldout.aggregate.composite,
+      });
+    } catch { /* gate unavailable; skip */ }
+    const constraintsPass = cr.results.every((r) => r.passed); const composite = evaluation.aggregate.composite; const scoreDelta = composite - priorComposite; const accepted = constraintsPass && scoreDelta > 0 && (testPassed === undefined ? true : testPassed);
+    const candidateRecord: CandidateRecord = { ...draft, candidateFullText: fullText, evaluation, executionTraces: cTraces, constraints: cr.results, warnings: cr.warnings, semanticDriftScore: driftScore, testPassed, gateResults };
+    const iterRecord: IterationRecord = { iteration: iter, parentCandidate: parentName, mutationRationale: draft.rationale, reflectionPrompt: reflection, candidate: { name: draft.name, rationale: draft.rationale, candidateBody: draft.candidateBody }, evaluation, traces: cTraces, scoreDelta, accepted, gateResults };
+    iterations.push(iterRecord); await safeWriteFile(path.join(runDir, "iterations", `${iter}.json`), JSON.stringify({ ...iterRecord, candidateFullText: fullText, constraints: cr.results, warnings: cr.warnings, semanticDriftScore: driftScore, testPassed, gateResults }, null, 2));
+    if (accepted) { candidates.push(candidateRecord); parentName = draft.name; priorComposite = composite; }
+    else { options.onProgress?.("iteration", `${iter} rejected: delta=${scoreDelta.toFixed(3)} constraints=${constraintsPass} test=${testPassed ?? "n/a"}`); }
+    priorTraces = cTraces; priorEvaluation = evaluation;
   }
-
-  if (candidates.length === 0) throw new Error("All candidates rejected by constraints.");
+  if (candidates.length === 0) {
+    // Fallback: take the iteration with the best validation composite even if not strictly accepted.
+    if (iterations.length === 0) throw new Error("Iterative loop produced no candidates.");
+    const best = [...iterations].sort((a, b) => b.evaluation.aggregate.composite - a.evaluation.aggregate.composite)[0]!;
+    const fullText = reassembleArtifact(target.frontmatter, best.candidate.candidateBody);
+    const cr = validateConstraints(target, best.candidate.candidateBody, fullText, constraintConfig);
+    options.onProgress?.("iterations", `Fallback acceptance: no iteration met strict criteria; promoting "${best.candidate.name}" (composite=${best.evaluation.aggregate.composite.toFixed(3)})`);
+    candidates.push({ ...best.candidate, candidateFullText: fullText, evaluation: best.evaluation, executionTraces: best.traces, constraints: cr.results, warnings: [...cr.warnings, "Fallback acceptance: no iteration met strict acceptance criteria."], semanticDriftScore: undefined, testPassed: undefined, wasFallbackPromoted: true, gateResults: best.gateResults });
+  }
   candidates.sort((a, b) => b.evaluation.aggregate.composite - a.evaluation.aggregate.composite);
   const bestCandidate = candidates[0]!;
   options.onProgress?.("confirm", `${bestCandidate.name} on holdout`);
@@ -624,6 +697,7 @@ async function runTypeScriptEvolution(options: {
     maxBytes,
     baselineTraces,
     prResult,
+    iterations,
   };
 
   options.onProgress?.("write", "Writing artifacts");
@@ -652,6 +726,8 @@ async function runTypeScriptEvolution(options: {
       constraints: bestCandidate.constraints,
       semanticDriftScore: bestCandidate.semanticDriftScore,
       testPassed: bestCandidate.testPassed,
+      acceptanceMode: bestCandidate.wasFallbackPromoted ? "fallback" : "strict",
+      wasFallbackPromoted: bestCandidate.wasFallbackPromoted === true,
     },
     candidates: candidates.map((c) => ({
       name: c.name,
@@ -674,6 +750,21 @@ async function runTypeScriptEvolution(options: {
   await safeWriteFile(path.join(tracesDir, "all-traces.json"), JSON.stringify(allTraces, null, 2));
   const failureOnly = allTraces.filter((t) => t.isFailure);
   if (failureOnly.length > 0) await safeWriteFile(path.join(tracesDir, "failure-traces.json"), JSON.stringify(failureOnly, null, 2));
+  // Top-level gate.json with best candidate's tier results (always written, even when empty).
+  await safeWriteFile(path.join(runDir, "gate.json"), JSON.stringify(bestCandidate.gateResults ?? [], null, 2));
+  // Lineage: append entry linking this run to its ancestor (sibling lane provides module).
+  try {
+    const bestHoldoutComposite = bestCandidate.holdoutEvaluation?.aggregate.composite ?? bestCandidate.evaluation.aggregate.composite;
+    const artifactHash = crypto.createHash("sha256").update(bestCandidate.candidateFullText).digest("hex").slice(0, 16);
+    // parentArtifactHash should reference the prior run's winning artifactHash (cross-run
+    // chaining), falling back to the pre-mutation source hash only when there is no ancestor.
+    const ancestorEntry = ancestor as LineageEntry | undefined;
+    const parentArtifactHash = ancestorEntry?.artifactHash
+      ?? crypto.createHash("sha256").update(target.fullText).digest("hex").slice(0, 16);
+    const runId = path.basename(runDir);
+    const entry: LineageEntry = { runId, parentRunId: ancestorEntry?.runId, artifactHash, parentArtifactHash, score: bestHoldoutComposite, mutationRationale: bestCandidate.rationale, createdAt: new Date().toISOString() };
+    await appendLineageEntry(options.cwd, entry);
+  } catch { /* sibling module unavailable */ }
   return result;
 }
 
@@ -681,6 +772,10 @@ export async function runEvolution(options: {
   cwd: string; targetPath: string; objective: string; evalSource: EvalSource; model?: string; thinkingLevel?: string;
   candidateCount: number; maxExamples: number; sessionQuery?: string; backend?: "auto" | "typescript" | "python";
   goldenTaskId?: string; testCommand?: string; testTimeout?: number; createPR?: boolean; persistGolden?: boolean;
+  seed?: number; cohortExamples?: EvalExample[];
+  cohortJudgeFunc?: (examples: EvalExample[]) => Promise<{ composite: number }>;
+  coherenceCheck?: () => Promise<{ passed: boolean; detail: string }>;
+  tsConfigPath?: string;
   signal?: AbortSignal; onProgress?: (phase: string, detail?: string) => void;
 }): Promise<EvolutionSummaryDetails> {
   const preferred = options.backend ?? "auto";
@@ -700,7 +795,7 @@ export function buildToolSummary(r: EvolutionSummaryDetails): string {
 
 export function toToolSummaryDetails(result: EvolutionRunResult): EvolutionSummaryDetails {
   const allTraces = [...result.baselineTraces, ...result.candidates.flatMap((c) => c.executionTraces)];
-  return { runDir: result.paths.runDir, reportPath: result.paths.reportPath, targetPath: result.target.path, objective: result.objective, evalSource: result.evalSource, modelLabel: result.modelLabel, selectionSplit: result.selectionSplit, confirmationSplit: result.confirmationSplit, trainExamples: result.trainExamples.length, validationExamples: result.validationExamples.length, holdoutExamples: result.holdoutExamples.length, goldenTaskId: result.golden?.id ?? null, candidateCount: result.candidates.length, baselineValidationScore: result.baselineValidation.aggregate.composite, bestValidationScore: result.bestCandidate.evaluation.aggregate.composite, baselineHoldoutScore: result.baselineHoldout.aggregate.composite, bestHoldoutScore: result.bestCandidate.holdoutEvaluation?.aggregate.composite ?? result.bestCandidate.evaluation.aggregate.composite, improvement: result.improvement, bestCandidateName: result.bestCandidate.name, tracesCaptured: allTraces.length, constraintsPassed: result.bestCandidate.constraints.length > 0 ? result.bestCandidate.constraints.every((c) => c.passed) : true, testGatePassed: result.bestCandidate.testPassed, semanticDriftScore: result.bestCandidate.semanticDriftScore, prBranch: result.prResult?.branch, backend: "typescript", optimizerUsed: "typescript-proxy" };
+  return { runDir: result.paths.runDir, reportPath: result.paths.reportPath, targetPath: result.target.path, objective: result.objective, evalSource: result.evalSource, modelLabel: result.modelLabel, selectionSplit: result.selectionSplit, confirmationSplit: result.confirmationSplit, trainExamples: result.trainExamples.length, validationExamples: result.validationExamples.length, holdoutExamples: result.holdoutExamples.length, goldenTaskId: result.golden?.id ?? null, candidateCount: result.candidates.length, baselineValidationScore: result.baselineValidation.aggregate.composite, bestValidationScore: result.bestCandidate.evaluation.aggregate.composite, baselineHoldoutScore: result.baselineHoldout.aggregate.composite, bestHoldoutScore: result.bestCandidate.holdoutEvaluation?.aggregate.composite ?? result.bestCandidate.evaluation.aggregate.composite, improvement: result.improvement, bestCandidateName: result.bestCandidate.name, tracesCaptured: allTraces.length, constraintsPassed: result.bestCandidate.constraints.length > 0 ? result.bestCandidate.constraints.every((c) => c.passed) : true, testGatePassed: result.bestCandidate.testPassed, semanticDriftScore: result.bestCandidate.semanticDriftScore, prBranch: result.prResult?.branch, backend: "typescript", optimizerUsed: "gepa-iterative" };
 }
 
 export interface ApplyManifest {

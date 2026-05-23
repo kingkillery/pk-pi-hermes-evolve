@@ -11,12 +11,25 @@ This package adapts the *Hermes Phase 1 idea* to pi:
 - save a reviewable report and candidate files under `.pi/hermes-self-evolution/`
 - **never overwrite the original target automatically**
 
-It is a **pi-native extension** with a **hybrid backend model**:
+It is a **pi-native extension** with a **TypeScript-native engine**:
 
-- **TypeScript backend**: always available, uses pi subprocess calls as a local proxy-evolution loop
-- **Python backend**: optional, uses a real DSPy/GEPA-style path when Python + DSPy are installed
+- **TypeScript backend**: the source-of-truth implementation — iterative reflective loop, Hermes-weighted judge, tiered constraint pipeline, execution traces, golden datasets, PR automation
+- **Python acceleration mode**: optional sidecar (`--accelerate`) — activates when Python + DSPy are installed; adds a DSPy/GEPA optimizer path on top of the TS engine's same guardrails
 
 The core loop is modeled after Hermes' mutation → evaluation → guardrails → human review flow, but adapted to pi extension APIs and local pi session history.
+
+## Documentation
+
+| Document | Contents |
+|---|---|
+| [docs/architecture.md](docs/architecture.md) | Module map, end-to-end run pipeline, iterative loop, executor, tiered gate, constraint pipeline, lineage, backend selection |
+| [docs/configuration.md](docs/configuration.md) | Every tool parameter, `/evolve` flag, env var, constraint config option, and common recipes |
+| [docs/output-layout.md](docs/output-layout.md) | Run-directory format, manifest / dataset / iteration / executor / trace schemas, lineage and golden dataset layouts |
+| [docs/ownership-map.md](docs/ownership-map.md) | The 5-lane disjoint-ownership pattern used to land Phase 1 parity |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | Code organization, style, verification gates, parallel-PRD dispatch pattern, soft-spot policy, release process |
+| [CHANGELOG.md](CHANGELOG.md) | Version history |
+
+The full documentation index is at [docs/README.md](docs/README.md).
 
 ## Pi docs reviewed for this package
 
@@ -73,9 +86,9 @@ Use it when you explicitly want the model to improve a local instruction artifac
 
 ### Backends
 
-- `auto` → prefer Python DSPy backend when available, otherwise TypeScript fallback
-- `python` → require the Python backend
-- `typescript` → force the TypeScript-only path
+- `typescript` → TypeScript engine (default; always available)
+- `--accelerate` / `auto` → TypeScript engine + Python DSPy acceleration when available
+- `python` → require the Python acceleration sidecar (error if unavailable)
 
 ## Install
 
@@ -99,25 +112,25 @@ pi install -l npm:pk-pi-hermes-evolve
 pi -e npm:pk-pi-hermes-evolve
 ```
 
-## Python DSPy backend
+## Python acceleration mode (optional)
 
-The npm package includes an optional Python sidecar under `python_backend/`.
+The npm package includes an optional Python sidecar under `python_backend/`. The TypeScript engine is fully functional without it.
 
-Install it manually if you want the hybrid DSPy/GEPA path:
+Install the sidecar if you want DSPy/GEPA acceleration:
 
 ```bash
 cd python_backend
 pip install -e .
 ```
 
-The extension looks for Python in this order:
+The extension searches for Python in this order:
 
 1. `PI_HERMES_EVOLVE_PYTHON`
 2. `python3`
 3. `python`
 
-If DSPy is installed, `backend: auto` will use the Python backend.
-Otherwise it falls back to TypeScript.
+When DSPy is detected and `backend` is `auto`, the Python acceleration sidecar is activated.
+Without it, the TypeScript engine runs the full evolution loop on its own.
 
 ## Usage
 
@@ -202,35 +215,38 @@ Current guardrails mirror Hermes' spirit, but stay lightweight and local:
 - candidates over the size budget are rejected
 - human review is always required before applying changes
 
-## Important limitations
+## Hermes Phase 1 parity
 
-This is still **not** a full Hermes reproduction.
+The TypeScript engine implements the Hermes Phase 1 workflow end-to-end. Status by capability:
 
-What the Python upgrade adds:
+| Capability | Status | Where |
+|---|---|---|
+| 3-source dataset (synthetic / session / mixed) | ✅ | `generateDataset` in `src/engine.ts` |
+| Train / validation / holdout split | ✅ | `splitExamples` in `src/engine.ts` |
+| Golden dataset persistence by task id | ✅ | `saveGoldenDataset` / `loadGoldenDataset` |
+| Hermes-weighted judge (0.5 / 0.3 / 0.2) | ✅ | `evaluateArtifact` in `src/engine.ts` |
+| 7-check constraint validator (non_empty, size, growth, placeholder, heading, frontmatter, drift, skill_structure) | ✅ | `validateConstraints` + `src/constraints-structure.ts` |
+| Execution traces (all + failures) | ✅ | `buildTrace` in `src/engine.ts` |
+| Secret scanner on datasets | ✅ | `scanForSecrets` in `src/engine.ts` |
+| Optional test-command gate | ✅ | `runTestCommand` in `src/engine.ts` |
+| Optional PR automation (branch + `gh pr create`) | ✅ | `createGitBranchWithCandidate` |
+| **Iterative reflective loop** (GEPA-shape) | ✅ | iteration loop in `runTypeScriptEvolution`; `IterationRecord[]` in `iterations/` |
+| **Pi-native executor** (real stdout, not predicted) | ✅ | `src/pi-executor.ts` → `executeCandidateInPi` |
+| **Tiered regression gate** (typecheck → cohort → coherence) | ✅ | `src/tiered-gate.ts` → `runTieredGate` |
+| **SKILL.md structural validator** (name + description in first 500 chars) | ✅ | `src/constraints-structure.ts` |
+| **Cross-run lineage memory** (`lineage.jsonl`, Pareto-best ancestor) | ✅ | `src/lineage.ts` |
+| **TS as default, Python as `--accelerate`** | ✅ | reframed throughout this README and `src/python-backend.ts` |
+| Python DSPy/GEPA acceleration sidecar | 🟦 optional | `python_backend/` |
+| OTel-traced Ralph loop for parity work | 🟦 optional | `scripts/ralph_otel.py` |
+| Sokoban benchmark scaffold | 🟦 optional | `scripts/sokoban_benchmark.py` |
 
-- a real Python backend bundled with the npm package
-- DSPy-based dataset generation, judging, and candidate synthesis
-- a GEPA path when the installed DSPy build exposes `dspy.GEPA`
-- automatic fallback to MIPROv2 or plain Chain-of-Thought if GEPA is unavailable
+What is still out of scope versus the full Nous vision:
 
-What the latest parity upgrade adds:
+- Hermes Phases 2–5 (tool-description / system-prompt / tool-implementation-code evolution, continuous auto-improvement loop)
+- code-organism evolution via Darwinian Evolver
+- no built-in pytest gate (use `testCommand` to wire one)
 
-- a **three-way dataset split** (train / validation / holdout) in both TypeScript and Python backends
-- **golden dataset support**: when a `goldenTaskId` is provided, the validation split is tagged as a golden set for reproducible cross-run evaluation
-- **traced Ralph loop** (`scripts/ralph_otel.py`) with OpenTelemetry spans for `ralph.run/<task>`, `loop.step`, `model.infer`, `tool`, and `judge`
-- **deterministic repo-deliverable checks** in the judge (execution traces, validation split, golden datasets)
-- a **Sokoban benchmark scaffold** (`scripts/sokoban_benchmark.py`) for initializing repeatable 5-attempt baseline/improvement runs, preparing per-attempt artifacts, recording results, and summarizing held-out performance
-- **diff rendering**: every run writes `diff.patch` and embeds a `## Diff` section in `report.md` so you can see exactly what changed
-- **apply/approve workflow**: `/evolve apply [runDir]` copies the best candidate to the original target with diff preview and explicit confirmation
-- **artifact-type rubric presets**: the judge uses type-specific scoring guidance (`skill` / `prompt` / `instructions`) in both TypeScript and Python backends
-
-What is still missing versus the full Nous vision:
-
-- no automatic pytest / external benchmark gate yet
-- no code-organism evolution
-- still optimized mainly for prompt/instruction artifacts, not general source code
-
-So treat this as a practical **hybrid phase-1 self-evolution package for pi**.
+This package implements **Hermes Phase 1 in TypeScript** as a first-class pi extension.
 
 ## Development
 
