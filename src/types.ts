@@ -258,6 +258,7 @@ export interface TieredGateResult {
 export interface LineageEntry {
   runId: string;
   parentRunId?: string;
+  artifactPath?: string;
   artifactHash: string;
   parentArtifactHash?: string;
   score: number;

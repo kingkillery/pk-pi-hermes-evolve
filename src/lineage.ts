@@ -26,6 +26,11 @@ function slugFromPath(artifactPath: string): { basename: string; slug: string } 
   return { basename, slug };
 }
 
+function normalizeArtifactPath(cwd: string, artifactPath: string): string {
+  const absolute = path.isAbsolute(artifactPath) ? artifactPath : path.join(cwd, artifactPath);
+  return path.normalize(path.relative(cwd, absolute));
+}
+
 export async function appendLineageEntry(cwd: string, entry: LineageEntry): Promise<void> {
   const file = lineagePath(cwd);
   await fs.mkdir(path.dirname(file), { recursive: true });
@@ -55,9 +60,11 @@ export async function loadLineage(cwd: string): Promise<LineageEntry[]> {
  * Callers usually know an artifact's path before its new content is materialized, so:
  *   - If `artifactContent` is supplied, hash it and return the highest-score entry whose
  *     `artifactHash` matches exactly. This is the precise lookup.
- *   - If only `artifactPath` is supplied, fall back to a path-locality heuristic: select
- *     entries whose `runId` contains the artifact basename (engine convention) and return
- *     the highest-score entry from that subset.
+ *   - If only `artifactPath` is supplied, prefer an exact normalized path match against the
+ *     stored lineage `artifactPath`. This avoids cross-artifact false positives when multiple
+ *     files share the same basename.
+ *   - For legacy lineage entries that predate `artifactPath`, fall back to the previous
+ *     basename/slug heuristic only when *no* entry in the lineage has path metadata.
  *   - When neither an exact content hash match nor a runId-substring match exists, return
  *     `null` rather than falling back to the global-highest-score entry. This prevents
  *     false-positive ancestor lookups for unknown paths. See Lane D smoke findings.
@@ -76,6 +83,12 @@ export async function loadBestAncestor(
     if (matches.length === 0) return null;
     return pickHighestScore(matches);
   }
+
+  const normalizedTargetPath = normalizeArtifactPath(cwd, artifactPath);
+  const byArtifactPath = entries.filter((e) => e.artifactPath && normalizeArtifactPath(cwd, e.artifactPath) === normalizedTargetPath);
+  if (byArtifactPath.length > 0) return pickHighestScore(byArtifactPath);
+
+  if (entries.some((e) => typeof e.artifactPath === "string" && e.artifactPath.length > 0)) return null;
 
   const { basename, slug } = slugFromPath(artifactPath);
   const byRunId = entries.filter((e) => e.runId.includes(basename) || (slug.length > 0 && e.runId.includes(slug)));

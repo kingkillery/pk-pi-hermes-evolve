@@ -34,6 +34,7 @@ function isLineageEntry(obj: unknown): obj is LineageEntry {
   const o = obj as Record<string, unknown>;
   return (
     typeof o["runId"] === "string" &&
+    (o["artifactPath"] === undefined || typeof o["artifactPath"] === "string") &&
     typeof o["artifactHash"] === "string" &&
     typeof o["score"] === "number" &&
     typeof o["mutationRationale"] === "string" &&
@@ -81,6 +82,7 @@ export async function runLineageVerifier(runDirs: string[]): Promise<void> {
   log("run-1 runId", entry1.runId);
   log("run-1 artifactHash", entry1.artifactHash);
   log("run-2 runId", entry2.runId);
+  log("run-2 artifactPath", entry2.artifactPath ?? "(none)");
   log("run-2 artifactHash", entry2.artifactHash);
   log("run-2 parentRunId", entry2.parentRunId ?? "(none)");
   log("run-2 parentArtifactHash", entry2.parentArtifactHash ?? "(none)");
@@ -128,38 +130,23 @@ export async function runLineageVerifier(runDirs: string[]): Promise<void> {
     log("result artifactHash", probe1.artifactHash);
   }
 
-  // --- 6. Probe 2: path-only (fuzzy) ---
-  console.log("\n[probe-2] path-only fuzzy (soft-spot)");
-  const slug = path.basename(SKILL_FIXTURE);
-  log("slug tested against runId substring", slug);
+  // --- 6. Probe 2: path-only exact match ---
+  console.log("\n[probe-2] path-only exact match");
   const probe2 = await loadBestAncestor(REPO_ROOT, SKILL_FIXTURE);
-  if (probe2 === null) {
-    console.log("  result: null");
-  } else {
-    const matchedViaSubstring = entries.some((e) => e.runId.includes(slug));
-    const matchMethod = matchedViaSubstring ? "substring" : "global-highest-score fallback";
-    log("result runId", probe2.runId);
-    log("matched via", matchMethod);
-    if (!matchedViaSubstring) {
-      console.log(
-        "  SOFT-SPOT: no runId contains the artifact basename; returned global-highest-score entry (false-positive for unknown paths)",
-      );
-    }
-  }
+  assert(probe2 !== null, "path-only lookup should resolve the known artifact");
+  log("result runId", probe2.runId);
+  log("result artifactPath", probe2.artifactPath ?? "(none)");
+  assert(
+    probe2.artifactPath === path.relative(REPO_ROOT, SKILL_FIXTURE),
+    `path-only lookup should return ${path.relative(REPO_ROOT, SKILL_FIXTURE)}`,
+  );
 
   // --- 7. Probe 3: wrong path ---
-  console.log("\n[probe-3] wrong path (should return null or false-positive)");
+  console.log("\n[probe-3] wrong path");
   const wrongPath = path.join(REPO_ROOT, "tests", "fixtures", "does-not-exist", "SKILL.md");
   const probe3 = await loadBestAncestor(REPO_ROOT, wrongPath);
-  if (probe3 === null) {
-    console.log("  result: null (clean — no false-positive)");
-  } else {
-    log("result runId", probe3.runId);
-    console.log(
-      "  SOFT-SPOT: wrong path returned a fallback entry — global-highest-score fallback" +
-        " applies whenever no runId substring matches, even for completely unknown paths",
-    );
-  }
+  assert(probe3 === null, "wrong path should not return a false-positive ancestor");
+  console.log("  result: null (clean — no false-positive)");
 
   console.log("\n=== Lane D: all assertions passed ===\n");
 }
