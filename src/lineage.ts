@@ -88,7 +88,7 @@ export async function loadBestAncestor(
   const byArtifactPath = entries.filter((e) => e.artifactPath && normalizeArtifactPath(cwd, e.artifactPath) === normalizedTargetPath);
   if (byArtifactPath.length > 0) return pickHighestScore(byArtifactPath);
 
-  if (entries.some((e) => typeof e.artifactPath === "string" && e.artifactPath.length > 0)) return null;
+  if (entries.some((e) => e.artifactPath)) return null;
 
   const { basename, slug } = slugFromPath(artifactPath);
   const byRunId = entries.filter((e) => e.runId.includes(basename) || (slug.length > 0 && e.runId.includes(slug)));
