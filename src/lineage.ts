@@ -85,10 +85,19 @@ export async function loadBestAncestor(
   }
 
   const normalizedTargetPath = normalizeArtifactPath(cwd, artifactPath);
-  const byArtifactPath = entries.filter((e) => e.artifactPath && normalizeArtifactPath(cwd, e.artifactPath) === normalizedTargetPath);
+  const entriesWithArtifactPath = entries.flatMap((entry) => {
+    if (!entry.artifactPath) return [];
+    return [{ entry, normalizedArtifactPath: normalizeArtifactPath(cwd, entry.artifactPath) }];
+  });
+  const byArtifactPath = entriesWithArtifactPath
+    .filter(({ normalizedArtifactPath }) => normalizedArtifactPath === normalizedTargetPath)
+    .map(({ entry }) => entry);
   if (byArtifactPath.length > 0) return pickHighestScore(byArtifactPath);
 
-  if (entries.some((e) => e.artifactPath)) return null;
+  // Once any lineage entry records its source path, avoid falling back to basename/slug
+  // matching for a path miss; mixing the old heuristic with exact path metadata would
+  // reintroduce the same false positives this lookup is trying to eliminate.
+  if (entriesWithArtifactPath.length > 0) return null;
 
   const { basename, slug } = slugFromPath(artifactPath);
   const byRunId = entries.filter((e) => e.runId.includes(basename) || (slug.length > 0 && e.runId.includes(slug)));
