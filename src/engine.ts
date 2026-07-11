@@ -652,7 +652,16 @@ async function runTypeScriptEvolution(options: {
     const parentArtifactHash = ancestorEntry?.artifactHash
       ?? crypto.createHash("sha256").update(target.fullText).digest("hex").slice(0, 16);
     const runId = path.basename(runDir);
-    const entry: LineageEntry = { runId, parentRunId: ancestorEntry?.runId, artifactHash, parentArtifactHash, score: bestHoldoutComposite, mutationRationale: bestCandidate.rationale, createdAt: new Date().toISOString() };
+    const entry: LineageEntry = {
+      runId,
+      parentRunId: ancestorEntry?.runId,
+      artifactPath: path.relative(options.cwd, target.path),
+      artifactHash,
+      parentArtifactHash,
+      score: bestHoldoutComposite,
+      mutationRationale: bestCandidate.rationale,
+      createdAt: new Date().toISOString(),
+    };
     await appendLineageEntry(options.cwd, entry);
   } catch { /* sibling module unavailable */ }
   return result;
