@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### GEPA-Pareto upgrade to the reflective loop
+
+Aligns the iterative loop in `src/engine.ts` with GEPA ("Reflective Prompt Evolution Can Outperform Reinforcement Learning", arXiv:2507.19457) — the current state-of-the-art reflective/evolutionary prompt optimizer, which this package's `optimizerUsed` label already claimed lineage from without implementing the algorithm's core mechanisms.
+
+- fix a correctness bug where every mutation was generated from the pristine original artifact body regardless of `parentName`, so accepted gains from prior iterations were discarded rather than compounded; `generateOneCandidateDraft` now takes `parentBody` and mutates the actual selected parent
+- replace single-lineage greedy hill-climbing (`accepted = scoreDelta > priorComposite`, chaining from the single last-accepted candidate) with a Pareto-frontier candidate pool: `computeParetoFrontier` tracks per-validation-instance winners and prunes dominated candidates; `selectParetoParent` samples the next mutation parent proportional to frontier appearance, which avoids collapsing to a local optimum once the first easy gains are exhausted
+- add a cheap train-set minibatch pre-filter (`evaluateArtifact` on 1-2 examples) before paying for a full validation pass with the real `pi` executor; only a clear regression vs. the parent's minibatch score is rejected, matching GEPA's "35x fewer rollouts" efficiency lever
+- move the tiered regression gate (typecheck → cohort → coherence) to run immediately after constraint validation, before the minibatch filter and full judge pass, since it is a cheap, quality-orthogonal safety signal that should short-circuit expensive rollouts rather than run after them
+- add a bounded system-aware merge (`generateMergeCandidateDraft`, GEPA Appendix F "crossover"): every third iteration, if the pool has ≥2 distinct mutation lineages on the frontier, attempt synthesizing one candidate from two frontier candidates' complementary per-instance strengths; capped at 2 attempts per run
+- final `bestCandidate` selection now considers every fully-validated pool member (not just the accepted chain), matching GEPA's "return candidate with best aggregate performance on validation set" stopping rule
+- extend `types.ts` additively: `CandidateRecord.parentCandidate/selectionMethod/minibatchScore`, `IterationRecord.selectionMethod/paretoFrontierSize/minibatchFiltered`, `EvolutionRunResult.paretoFrontier/mergeAttempts/minibatchFilteredCount`
+- `optimizerUsed` renamed from `"gepa-iterative"` to `"gepa-pareto"`; `report.md` gains an "Optimization strategy" section and the candidates table gains Parent/Method columns
+- README parity table and `tests/parity.test.ts` gain rows for the Pareto-frontier pool and system-aware merge
+
 ### TypeScript-native Hermes Phase 1 parity
 
 The TypeScript engine is now the source-of-truth implementation of the Hermes Phase 1 workflow. Python/DSPy is an optional acceleration mode rather than the primary backend.

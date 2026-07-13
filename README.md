@@ -227,7 +227,9 @@ The TypeScript engine implements the Hermes Phase 1 workflow end-to-end. Status 
 | Secret scanner on datasets | ✅ | `scanForSecrets` in `src/engine.ts` |
 | Optional test-command gate | ✅ | `runTestCommand` in `src/engine.ts` |
 | Optional PR automation (branch + `gh pr create`) | ✅ | `createGitBranchWithCandidate` |
-| **Iterative reflective loop** (GEPA-shape) | ✅ | iteration loop in `runTypeScriptEvolution`; `IterationRecord[]` in `iterations/` |
+| **Iterative reflective loop** (GEPA-Pareto: frontier-based parent selection, minibatch pre-filter, bounded system-aware merge) | ✅ | iteration loop in `runTypeScriptEvolution`; `IterationRecord[]` in `iterations/` |
+| **Pareto-frontier candidate pool** (illumination-style parent sampling instead of greedy hill-climbing; mutation edits the selected parent's own body) | ✅ | `computeParetoFrontier` / `selectParetoParent` in `src/engine.ts` |
+| **System-aware merge** (bounded crossover of two frontier candidates' complementary strengths) | ✅ | `generateMergeCandidateDraft` in `src/engine.ts` |
 | **Pi-native executor** (real stdout, not predicted) | ✅ | `src/pi-executor.ts` → `executeCandidateInPi` |
 | **Tiered regression gate** (typecheck → cohort → coherence) | ✅ | `src/tiered-gate.ts` → `runTieredGate` |
 | **SKILL.md structural validator** (name + description in first 500 chars) | ✅ | `src/constraints-structure.ts` |

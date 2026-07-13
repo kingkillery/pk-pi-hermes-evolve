@@ -150,6 +150,12 @@ export interface CandidateRecord extends CandidateDraft {
    * degenerate "winner" promotion without spelunking `warnings`.
    */
   wasFallbackPromoted?: boolean;
+  /** Name of the pool member this candidate was mutated (or merged) from. Undefined for the baseline itself. */
+  parentCandidate?: string;
+  /** How this candidate's draft was produced: reflective mutation of a Pareto-selected parent, or a merge of two frontier candidates. */
+  selectionMethod?: "mutation" | "merge";
+  /** Composite judge score on the cheap train-set minibatch, used as the pre-filter gate before a full validation pass. */
+  minibatchScore?: number;
 }
 
 export interface EvolutionOptions {
@@ -217,6 +223,12 @@ export interface EvolutionRunResult {
   baselineTraces: ExecutionTrace[];
   prResult?: PRAutomationResult;
   iterations?: IterationRecord[];
+  /** Names of the final Pareto-frontier candidates (best-on-at-least-one-validation-instance), for reporting. */
+  paretoFrontier?: string[];
+  /** Number of system-aware merge candidates attempted during this run. */
+  mergeAttempts?: number;
+  /** Number of iterations rejected by the minibatch pre-filter before reaching a full validation pass. */
+  minibatchFilteredCount?: number;
 }
 
 export interface ReflectionPrompt {
@@ -237,6 +249,18 @@ export interface IterationRecord {
   scoreDelta: number;
   accepted: boolean;
   gateResults?: TieredGateResult[];
+  /** How the draft evaluated in this iteration was produced. */
+  selectionMethod?: "mutation" | "merge";
+  /** Size of the Pareto frontier the parent was sampled from (mutation only). */
+  paretoFrontierSize?: number;
+  /**
+   * True when the candidate was rejected by the cheap minibatch pre-filter
+   * (composite on a small train subset did not beat its parent) and therefore
+   * never went through the expensive full-validation + real-executor pass.
+   * When true, `evaluation`/`traces` hold the minibatch-only results, not a
+   * validation-set evaluation.
+   */
+  minibatchFiltered?: boolean;
 }
 
 export interface ExecutionObservation {

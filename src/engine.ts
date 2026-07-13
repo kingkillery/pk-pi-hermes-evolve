@@ -380,21 +380,115 @@ function buildReflectionPrompt(objective: string, priorTraces: ExecutionTrace[],
   return { priorTraces, priorJudgeFeedback: judgeFeedback, objective, weaknessSummary: summarizeWeaknesses(priorEvaluation, 3) };
 }
 
-async function generateOneCandidateDraft(options: { cwd: string; model?: string; thinkingLevel?: string; target: ArtifactTarget; objective: string; trainExamples: EvalExample[]; reflection: ReflectionPrompt; maxBytes: number; iteration: number; parentName?: string; signal?: AbortSignal }): Promise<CandidateDraft> {
-  const failures = options.reflection.priorTraces.filter((t) => t.isFailure);
-  const traceSection = failures.length > 0 ? ["", "Observed failure traces (prior iteration):", ...failures.slice(0, 5).map((t, i) => `  ${i + 1}. Task: ${t.taskInput}\n     Scores: correctness=${t.scores.correctness.toFixed(2)}, procedure=${t.scores.procedureFollowing.toFixed(2)}, composite=${t.scores.composite.toFixed(2)}\n     Feedback: ${t.feedback}`)].join("\n") : "";
-  const feedbackSection = options.reflection.priorJudgeFeedback.length > 0 ? ["", "Prior judge feedback to address:", ...options.reflection.priorJudgeFeedback.slice(0, 6).map((f, i) => `  ${i + 1}. ${f}`)].join("\n") : "";
-  const parentSection = options.parentName ? `\nParent candidate: ${options.parentName} (mutate; do not regress its gains).` : "\nParent candidate: <baseline>";
-  const prompt = [`Iteration: ${options.iteration}`, `Artifact type: ${options.target.type}`, `Path: ${options.target.path}`, `Objective: ${options.objective}`, `Max bytes: ${options.maxBytes}`, `Placeholders: ${options.target.placeholders.length > 0 ? options.target.placeholders.join(", ") : "none"}`, `Top heading: ${options.target.topHeading ?? "none"}`, parentSection, "", "Original BODY:", "```", options.target.body.trim(), "```", "", "Training tasks:", options.trainExamples.map((e, i) => `${i + 1}. ${e.taskInput}\n   Rubric: ${e.expectedBehavior}`).join("\n\n"), "", "Weaknesses (prior):", options.reflection.weaknessSummary, traceSection, feedbackSection, "", 'Return JSON: {"name":"short-kebab","rationale":"paragraph explaining mutation","candidateBody":"full revised body"}', "", "Rules: produce ONE revision that targets the prior failure traces and judge feedback, preserve placeholders, keep markdown valid, never mention evaluation/scores."].join("\n");
-  const raw = await runPiTextTask({ cwd: options.cwd, model: options.model, thinkingLevel: options.thinkingLevel, systemPrompt: CANDIDATE_SYSTEM_PROMPT, prompt, signal: options.signal });
+function mean(values: number[]): number {
+  return values.length === 0 ? 0 : values.reduce((s, v) => s + v, 0) / values.length;
+}
+
+function weightedRandomPick<T>(items: T[], weights: number[], rng: () => number): T {
+  const total = weights.reduce((s, w) => s + w, 0);
+  if (total <= 0) return items[Math.floor(rng() * items.length)] ?? items[0]!;
+  let r = rng() * total;
+  for (let i = 0; i < items.length; i += 1) {
+    r -= weights[i]!;
+    if (r <= 0) return items[i]!;
+  }
+  return items[items.length - 1]!;
+}
+
+/**
+ * GEPA-style "illumination" candidate pool member: an evolved (or baseline) artifact body
+ * plus its per-instance validation scores, used for Pareto-frontier parent selection
+ * instead of naive greedy hill-climbing on the aggregate score alone.
+ * See GEPA: Reflective Prompt Evolution Can Outperform Reinforcement Learning (arXiv:2507.19457).
+ */
+interface ParetoPoolEntry {
+  name: string;
+  body: string;
+  fullText: string;
+  validationScores: number[];
+  minibatchScore: number;
+  traces: ExecutionTrace[];
+  evaluation: ArtifactEvaluation;
+}
+
+/**
+ * Instance-wise Pareto frontier (GEPA Algorithm 2): for each validation instance, find the
+ * pool members achieving the max score on it, union those "winner" sets into a frontier, then
+ * prune any member whose winner-set is a strict subset of another member's — it contributes no
+ * unique strength once the merge/mutation history has produced something at least as good.
+ */
+function computeParetoFrontier(pool: ParetoPoolEntry[]): { frontier: ParetoPoolEntry[]; winCounts: number[] } {
+  if (pool.length === 0) return { frontier: [], winCounts: [] };
+  const numInstances = Math.max(0, ...pool.map((p) => p.validationScores.length));
+  const EPS = 1e-9;
+  const bestPerInstance: number[] = [];
+  for (let i = 0; i < numInstances; i += 1) bestPerInstance.push(Math.max(...pool.map((p) => p.validationScores[i] ?? -Infinity)));
+  const winSets = pool.map((p) => {
+    const wins = new Set<number>();
+    for (let i = 0; i < numInstances; i += 1) if ((p.validationScores[i] ?? -Infinity) >= bestPerInstance[i]! - EPS) wins.add(i);
+    return wins;
+  });
+  let frontierIdx = pool.map((_, i) => i).filter((i) => winSets[i]!.size > 0);
+  if (frontierIdx.length === 0) frontierIdx = pool.map((_, i) => i);
+  const isSuperset = (a: Set<number>, b: Set<number>) => { for (const v of b) if (!a.has(v)) return false; return true; };
+  frontierIdx = frontierIdx.filter((i) => !frontierIdx.some((j) => j !== i && winSets[j]!.size > winSets[i]!.size && isSuperset(winSets[j]!, winSets[i]!)));
+  return { frontier: frontierIdx.map((i) => pool[i]!), winCounts: frontierIdx.map((i) => Math.max(1, winSets[i]!.size)) };
+}
+
+function selectParetoParent(pool: ParetoPoolEntry[], rng: () => number): { parent: ParetoPoolEntry; frontierSize: number } {
+  const { frontier, winCounts } = computeParetoFrontier(pool);
+  if (frontier.length === 0) return { parent: pool[0]!, frontierSize: 0 };
+  return { parent: weightedRandomPick(frontier, winCounts, rng), frontierSize: frontier.length };
+}
+
+function parseCandidateDraftPayload(raw: string, fallbackName: string): { name: string; rationale: string; candidateBody: string } {
   const payload = extractJsonPayload(raw) as Record<string, unknown> | unknown[];
   let r: Record<string, unknown> = {};
   if (Array.isArray(payload)) r = (payload[0] as Record<string, unknown>) ?? {};
   else { const p = payload as Record<string, unknown>; if (Array.isArray(p.candidates) && p.candidates.length > 0) r = (p.candidates[0] as Record<string, unknown>) ?? {}; else r = p; }
   let cb = String(r.candidateBody ?? r.candidate_body ?? "").trim();
-  if (!cb) throw new Error(`Iteration ${options.iteration}: model returned no candidateBody.`);
+  if (!cb) throw new Error(`${fallbackName}: model returned no candidateBody.`);
   if (cb.startsWith("---")) cb = splitFrontmatter(cb).body;
-  return { name: slugify(String(r.name ?? `iter-${options.iteration}`)) || `iter-${options.iteration}`, rationale: String(r.rationale ?? "").trim() || `Iteration ${options.iteration} mutation.`, candidateBody: cb };
+  return { name: slugify(String(r.name ?? fallbackName)) || fallbackName, rationale: String(r.rationale ?? "").trim() || `${fallbackName} mutation.`, candidateBody: cb };
+}
+
+async function generateOneCandidateDraft(options: { cwd: string; model?: string; thinkingLevel?: string; target: ArtifactTarget; objective: string; trainExamples: EvalExample[]; reflection: ReflectionPrompt; maxBytes: number; iteration: number; parentName?: string; parentBody: string; signal?: AbortSignal }): Promise<CandidateDraft> {
+  const failures = options.reflection.priorTraces.filter((t) => t.isFailure);
+  const traceSection = failures.length > 0 ? ["", "Observed failure traces (from the parent candidate below):", ...failures.slice(0, 5).map((t, i) => `  ${i + 1}. Task: ${t.taskInput}\n     Scores: correctness=${t.scores.correctness.toFixed(2)}, procedure=${t.scores.procedureFollowing.toFixed(2)}, composite=${t.scores.composite.toFixed(2)}\n     Feedback: ${t.feedback}`)].join("\n") : "";
+  const feedbackSection = options.reflection.priorJudgeFeedback.length > 0 ? ["", "Prior judge feedback to address:", ...options.reflection.priorJudgeFeedback.slice(0, 6).map((f, i) => `  ${i + 1}. ${f}`)].join("\n") : "";
+  const parentSection = options.parentName ? `\nParent candidate: ${options.parentName} (this is the Pareto-frontier candidate selected to mutate; edit its BODY below, do not regress its gains).` : "\nParent candidate: <baseline>";
+  const prompt = [`Iteration: ${options.iteration}`, `Artifact type: ${options.target.type}`, `Path: ${options.target.path}`, `Objective: ${options.objective}`, `Max bytes: ${options.maxBytes}`, `Placeholders: ${options.target.placeholders.length > 0 ? options.target.placeholders.join(", ") : "none"}`, `Top heading: ${options.target.topHeading ?? "none"}`, parentSection, "", "Parent BODY (mutate this, not the original):", "```", options.parentBody.trim(), "```", "", "Training tasks:", options.trainExamples.map((e, i) => `${i + 1}. ${e.taskInput}\n   Rubric: ${e.expectedBehavior}`).join("\n\n"), "", "Weaknesses (parent):", options.reflection.weaknessSummary, traceSection, feedbackSection, "", 'Return JSON: {"name":"short-kebab","rationale":"paragraph explaining mutation","candidateBody":"full revised body"}', "", "Rules: produce ONE revision of the parent BODY that targets its failure traces and judge feedback, preserve placeholders, keep markdown valid, never mention evaluation/scores."].join("\n");
+  const raw = await runPiTextTask({ cwd: options.cwd, model: options.model, thinkingLevel: options.thinkingLevel, systemPrompt: CANDIDATE_SYSTEM_PROMPT, prompt, signal: options.signal });
+  return parseCandidateDraftPayload(raw, `iter-${options.iteration}`);
+}
+
+/**
+ * System-aware merge (GEPA "crossover", Appendix F): pick two Pareto-frontier candidates from
+ * distinct mutation lineages that each win on different validation instances, and ask the model
+ * to synthesize a single body combining their complementary strengths. Bounded by MAX_MERGE_ATTEMPTS
+ * in the caller so this stays a rare, targeted operation rather than a per-iteration cost.
+ */
+async function generateMergeCandidateDraft(options: { cwd: string; model?: string; thinkingLevel?: string; target: ArtifactTarget; objective: string; a: ParetoPoolEntry; b: ParetoPoolEntry; maxBytes: number; iteration: number; signal?: AbortSignal }): Promise<CandidateDraft> {
+  const prompt = [
+    `Iteration: ${options.iteration} (system-aware merge)`,
+    `Artifact type: ${options.target.type}`, `Path: ${options.target.path}`, `Objective: ${options.objective}`, `Max bytes: ${options.maxBytes}`,
+    `Placeholders: ${options.target.placeholders.length > 0 ? options.target.placeholders.join(", ") : "none"}`,
+    "",
+    `Candidate A ("${options.a.name}") — strongest per-instance judge feedback:`,
+    summarizeWeaknesses(options.a.evaluation, 2),
+    "Candidate A BODY:", "```", options.a.body.trim(), "```",
+    "",
+    `Candidate B ("${options.b.name}") — strongest per-instance judge feedback:`,
+    summarizeWeaknesses(options.b.evaluation, 2),
+    "Candidate B BODY:", "```", options.b.body.trim(), "```",
+    "",
+    "Both candidates are on the Pareto frontier: each wins on validation instances the other does not.",
+    'Return JSON: {"name":"short-kebab","rationale":"paragraph explaining which sections came from A vs B","candidateBody":"full merged body"}',
+    "",
+    "Rules: synthesize ONE body that keeps A's strengths where A wins and B's strengths where B wins, resolve overlaps in favor of whichever is more concrete, preserve placeholders, keep markdown valid, never mention evaluation/scores.",
+  ].join("\n");
+  const raw = await runPiTextTask({ cwd: options.cwd, model: options.model, thinkingLevel: options.thinkingLevel, systemPrompt: CANDIDATE_SYSTEM_PROMPT, prompt, signal: options.signal });
+  return parseCandidateDraftPayload(raw, `merge-${options.iteration}`);
 }
 
 async function safeWriteFile(filePath: string, content: string): Promise<void> { await fs.mkdir(path.dirname(filePath), { recursive: true }); await withFileMutationQueue(filePath, async () => { await fs.writeFile(filePath, content, "utf8"); }); }
@@ -415,10 +509,17 @@ function buildReportMarkdown(result: EvolutionRunResult): string {
     `- **Baseline holdout:** ${baselineHoldout.toFixed(3)}`, `- **Confirmed holdout:** ${bestHoldout.toFixed(3)}`, `- **Improvement:** ${result.improvement >= 0 ? "+" : ""}${result.improvement.toFixed(3)}`,
     `- **Traces:** ${totalTraces} captured, ${failures.length} failures`, "",
     "## Guardrails", "- Original preserved, never auto-overwritten.", "- Frontmatter preserved verbatim.", "- Placeholders required to survive.", "- Size budget enforced.", "- Growth limited to 20%.", "- Semantic drift checked (threshold 0.4).", "- Secret scanning on datasets.", "",
+    "## Optimization strategy (GEPA-Pareto)",
+    "- Parent selection: Pareto-frontier sampling over per-instance validation scores (arXiv:2507.19457), not a single greedy best-so-far chain.",
+    "- Mutation edits the selected parent's own body, so accepted gains compound instead of being re-derived from the original each iteration.",
+    `- Minibatch pre-filter: ${result.minibatchFilteredCount ?? 0} draft(s) rejected on a cheap train-set subset before a full validation + real-executor pass.`,
+    `- System-aware merge attempts: ${result.mergeAttempts ?? 0}.`,
+    `- Final Pareto frontier: ${result.paretoFrontier && result.paretoFrontier.length > 0 ? result.paretoFrontier.join(", ") : "n/a"}.`,
+    "",
     "## Baseline weaknesses", summarizeWeaknesses(result.baselineTrain, 3), "",
     "## Execution traces", `- Total: ${totalTraces}`, `- Failures: ${failures.length}`, ...failures.slice(0, 5).map((t, i) => `${i + 1}. [${t.traceId}] composite=${t.scores.composite.toFixed(2)} — ${t.feedback.slice(0, 120)}`), "",
-    "## Candidates", "| Name | Validation | Holdout | Correctness | Procedure | Conciseness | Constraints | Drift |", "|---|---:|---:|---:|---:|---:|---|---|",
-    ...result.candidates.map((c) => `| ${c.name} | ${c.evaluation.aggregate.composite.toFixed(3)} | ${c.holdoutEvaluation?.aggregate.composite.toFixed(3) ?? "—"} | ${c.evaluation.aggregate.correctness.toFixed(3)} | ${c.evaluation.aggregate.procedureFollowing.toFixed(3)} | ${c.evaluation.aggregate.conciseness.toFixed(3)} | ${c.constraints.every((x) => x.passed) ? "✅" : "❌"} | ${c.semanticDriftScore?.toFixed(2) ?? "—"} |`),
+    "## Candidates", "| Name | Parent | Method | Validation | Holdout | Correctness | Procedure | Conciseness | Constraints | Drift |", "|---|---|---|---:|---:|---:|---:|---:|---|---|",
+    ...result.candidates.map((c) => `| ${c.name} | ${c.parentCandidate ?? "—"} | ${c.selectionMethod ?? "mutation"} | ${c.evaluation.aggregate.composite.toFixed(3)} | ${c.holdoutEvaluation?.aggregate.composite.toFixed(3) ?? "—"} | ${c.evaluation.aggregate.correctness.toFixed(3)} | ${c.evaluation.aggregate.procedureFollowing.toFixed(3)} | ${c.evaluation.aggregate.conciseness.toFixed(3)} | ${c.constraints.every((x) => x.passed) ? "✅" : "❌"} | ${c.semanticDriftScore?.toFixed(2) ?? "—"} |`),
     "",
     "## Best candidate", `- **Name:** ${result.bestCandidate.name}`, `- **Rationale:** ${result.bestCandidate.rationale}`,
     ...result.bestCandidate.constraints.map((c) => `- ${c.passed ? "✅" : "❌"} **${c.name}**: ${c.message}`),
@@ -477,19 +578,107 @@ async function runTypeScriptEvolution(options: {
   let ancestor: Awaited<ReturnType<typeof loadBestAncestor>> | undefined;
   try { ancestor = await loadBestAncestor(options.cwd, target.path); if (ancestor) options.onProgress?.("lineage", `ancestor_id=${(ancestor as LineageEntry).runId ?? "unknown"} score=${((ancestor as LineageEntry).score ?? 0).toFixed(3)}`); } catch { /* sibling module unavailable */ }
 
-  // Iterative reflective loop (Hermes-style): single candidate per iteration, reflection from prior traces.
+  // Iterative reflective loop, GEPA-Pareto style (arXiv:2507.19457): maintain a candidate pool
+  // and select each iteration's mutation parent via Pareto-frontier sampling instead of a single
+  // greedy best-so-far chain (which collapses to a local optimum once the first easy gains are
+  // exhausted). New drafts mutate the SELECTED PARENT's own body (not the pristine original) so
+  // gains actually compound. A cheap train-set minibatch pre-filters drafts before paying for a
+  // full validation pass with the real pi executor, and a bounded system-aware merge periodically
+  // combines two frontier candidates' complementary strengths into one.
   const iterationCount = Math.min(5, Math.max(1, options.candidateCount || 3));
   options.onProgress?.("iterations", `Running ${iterationCount} reflective iteration(s)`);
   const iterations: IterationRecord[] = []; const candidates: CandidateRecord[] = [];
-  let priorTraces: ExecutionTrace[] = baselineTraces; let priorEvaluation: ArtifactEvaluation = baselineTrain; let parentName: string | undefined; let priorComposite = baselineValidation.aggregate.composite;
+  const paretoRng = options.seed !== undefined ? mulberry32(options.seed ^ 0x9e3779b9) : Math.random;
+  const minibatch = train.slice(0, Math.max(1, Math.min(2, train.length)));
+  const pool: ParetoPoolEntry[] = [{
+    name: "baseline",
+    body: target.body,
+    fullText: target.fullText,
+    validationScores: baselineValidation.examples.map((e) => e.composite),
+    minibatchScore: mean(baselineTrain.examples.slice(0, minibatch.length).map((e) => e.composite)),
+    traces: baselineTraces,
+    evaluation: baselineTrain,
+  }];
+  const MERGE_EVERY = 3; const MAX_MERGE_ATTEMPTS = 2; let mergeAttempts = 0; let minibatchFilteredCount = 0;
   for (let iter = 1; iter <= iterationCount; iter += 1) {
-    options.onProgress?.("iteration", `${iter}/${iterationCount} reflect+mutate`);
-    const reflection = buildReflectionPrompt(options.objective, priorTraces, priorEvaluation);
-    let draft: CandidateDraft;
-    try { draft = await generateOneCandidateDraft({ cwd: options.cwd, model: options.model, thinkingLevel: options.thinkingLevel, target, objective: options.objective, trainExamples: train, reflection, maxBytes, iteration: iter, parentName, signal: options.signal }); }
-    catch (err) { options.onProgress?.("iteration", `${iter} skipped: ${err instanceof Error ? err.message : String(err)}`); continue; }
+    const { parent, frontierSize } = selectParetoParent(pool, paretoRng);
+    const parentReflection = buildReflectionPrompt(options.objective, parent.traces, parent.evaluation);
+    let draft: CandidateDraft | undefined; let selectionMethod: "mutation" | "merge" = "mutation";
+    let parentLabel = parent.name; let recordedReflection: ReflectionPrompt = parentReflection; let reportedFrontierSize = frontierSize;
+
+    // Merge eligibility uses distinct FRONTIER MEMBERS (not a persistent lineage id): mutation
+    // children are pool entries in their own right, each a candidate "lineage tip" with its own
+    // per-instance strengths, so any two distinct frontier members are valid merge parents.
+    if (iter > 1 && iter % MERGE_EVERY === 0 && mergeAttempts < MAX_MERGE_ATTEMPTS && pool.length >= 3) {
+      const { frontier } = computeParetoFrontier(pool);
+      if (frontier.length >= 2) {
+        const [a, b] = [frontier[0]!, frontier[frontier.length - 1]!];
+        options.onProgress?.("iteration", `${iter}/${iterationCount} merge ${a.name} + ${b.name}`);
+        try {
+          draft = await generateMergeCandidateDraft({ cwd: options.cwd, model: options.model, thinkingLevel: options.thinkingLevel, target, objective: options.objective, a, b, maxBytes, iteration: iter, signal: options.signal });
+          selectionMethod = "merge"; mergeAttempts += 1; parentLabel = `${a.name}+${b.name}`; reportedFrontierSize = frontier.length;
+          recordedReflection = { priorTraces: [], priorJudgeFeedback: [], objective: options.objective, weaknessSummary: `System-aware merge of Pareto-frontier candidates "${a.name}" and "${b.name}".` };
+        } catch (err) { options.onProgress?.("iteration", `${iter} merge skipped: ${err instanceof Error ? err.message : String(err)}`); }
+      }
+    }
+
+    if (!draft) {
+      options.onProgress?.("iteration", `${iter}/${iterationCount} reflect+mutate (parent=${parent.name}, frontier=${frontierSize})`);
+      try { draft = await generateOneCandidateDraft({ cwd: options.cwd, model: options.model, thinkingLevel: options.thinkingLevel, target, objective: options.objective, trainExamples: train, reflection: parentReflection, maxBytes, iteration: iter, parentName: parent.name, parentBody: parent.body, signal: options.signal }); }
+      catch (err) { options.onProgress?.("iteration", `${iter} skipped: ${err instanceof Error ? err.message : String(err)}`); continue; }
+    }
+
     const fullText = reassembleArtifact(target.frontmatter, draft.candidateBody);
     const cr = validateConstraints(target, draft.candidateBody, fullText, constraintConfig);
+    if (!cr.valid) {
+      const iterRecord: IterationRecord = { iteration: iter, parentCandidate: parentLabel, mutationRationale: draft.rationale, reflectionPrompt: recordedReflection, candidate: { name: draft.name, rationale: draft.rationale, candidateBody: draft.candidateBody }, evaluation: parent.evaluation, traces: [], scoreDelta: 0, accepted: false, selectionMethod, paretoFrontierSize: reportedFrontierSize };
+      iterations.push(iterRecord);
+      await safeWriteFile(path.join(runDir, "iterations", `${iter}.json`), JSON.stringify({ ...iterRecord, candidateFullText: fullText, constraints: cr.results, warnings: cr.warnings }, null, 2));
+      options.onProgress?.("iteration", `${iter} rejected: constraints failed`);
+      continue;
+    }
+
+    // Tiered regression gate (typecheck → cohort → coherence) runs first: it's cheap (no judge
+    // LLM calls beyond an optional injected callback) and orthogonal to draft quality, so a
+    // failing tier should short-circuit before paying for judge/executor rollouts at all.
+    let gateResults: TieredGateResult[] | undefined;
+    try {
+      gateResults = await runTieredGate({
+        cwd: options.cwd,
+        candidateText: fullText,
+        signal: options.signal,
+        cohortExamples: options.cohortExamples,
+        judgeFunc: options.cohortJudgeFunc,
+        coherenceCheck: options.coherenceCheck,
+        tsConfigPath: options.tsConfigPath,
+        baselineScore: baselineHoldout.aggregate.composite,
+      });
+    } catch { /* gate unavailable; skip */ }
+    if (gateResults && gateResults.some((r) => !r.passed)) {
+      const failedTier = gateResults.find((r) => !r.passed)!;
+      const iterRecord: IterationRecord = { iteration: iter, parentCandidate: parentLabel, mutationRationale: draft.rationale, reflectionPrompt: recordedReflection, candidate: { name: draft.name, rationale: draft.rationale, candidateBody: draft.candidateBody }, evaluation: parent.evaluation, traces: [], scoreDelta: 0, accepted: false, selectionMethod, paretoFrontierSize: reportedFrontierSize, gateResults };
+      iterations.push(iterRecord);
+      await safeWriteFile(path.join(runDir, "iterations", `${iter}.json`), JSON.stringify({ ...iterRecord, candidateFullText: fullText, constraints: cr.results, warnings: cr.warnings, gateResults }, null, 2));
+      options.onProgress?.("iteration", `${iter} rejected: tiered gate failed at "${failedTier.tier}" (${failedTier.reasonCode})`);
+      continue;
+    }
+
+    // Minibatch pre-filter: judge on a cheap 1-2 example train subset before paying for a full
+    // validation pass with the real pi executor. Only reject a CLEAR regression vs. the parent on
+    // the same subset — ties proceed, since a 1-2 example judge score is noisy and a tie carries
+    // no real signal to reject on. This is GEPA's main lever for the "35x fewer rollouts" result.
+    options.onProgress?.("iteration", `${iter} minibatch pre-filter`);
+    const { evaluation: minibatchEval, traces: minibatchTraces } = await evaluateArtifact({ cwd: options.cwd, model: options.model, thinkingLevel: options.thinkingLevel, target, artifactText: fullText, objective: options.objective, examples: minibatch, maxBytes, signal: options.signal });
+    const minibatchScore = minibatchEval.aggregate.composite;
+    if (minibatchScore < parent.minibatchScore - 1e-9) {
+      minibatchFilteredCount += 1;
+      const iterRecord: IterationRecord = { iteration: iter, parentCandidate: parentLabel, mutationRationale: draft.rationale, reflectionPrompt: recordedReflection, candidate: { name: draft.name, rationale: draft.rationale, candidateBody: draft.candidateBody }, evaluation: minibatchEval, traces: minibatchTraces, scoreDelta: minibatchScore - parent.minibatchScore, accepted: false, selectionMethod, paretoFrontierSize: reportedFrontierSize, minibatchFiltered: true, gateResults };
+      iterations.push(iterRecord);
+      await safeWriteFile(path.join(runDir, "iterations", `${iter}.json`), JSON.stringify({ ...iterRecord, candidateFullText: fullText, constraints: cr.results, warnings: cr.warnings, gateResults }, null, 2));
+      options.onProgress?.("iteration", `${iter} minibatch-filtered: ${minibatchScore.toFixed(3)} < parent ${parent.minibatchScore.toFixed(3)}`);
+      continue;
+    }
+
     options.onProgress?.("iteration", `${iter} judge on validation`);
     const execLogDir = path.join(runDir, "executor", String(iter));
     const { evaluation, traces: cTraces } = await evaluateArtifact({ cwd: options.cwd, model: options.model, thinkingLevel: options.thinkingLevel, target, artifactText: fullText, objective: options.objective, examples: validation, maxBytes, signal: options.signal, useRealExecutor: true, executorLogDir: execLogDir, artifactName: draft.name });
@@ -510,39 +699,37 @@ async function runTypeScriptEvolution(options: {
       testPassed = tr.passed; await safeWriteFile(target.path, target.fullText);
       if (!tr.passed) cr.warnings.push(`Test failed (exit ${tr.exitCode})`);
     }
-    // Tiered gate: real callbacks threaded from EvolutionOptions; skip-codes still apply when callbacks are unset.
-    let gateResults: TieredGateResult[] | undefined;
-    try {
-      gateResults = await runTieredGate({
-        cwd: options.cwd,
-        candidateText: fullText,
-        signal: options.signal,
-        cohortExamples: options.cohortExamples,
-        judgeFunc: options.cohortJudgeFunc,
-        coherenceCheck: options.coherenceCheck,
-        tsConfigPath: options.tsConfigPath,
-        baselineScore: baselineHoldout.aggregate.composite,
-      });
-    } catch { /* gate unavailable; skip */ }
-    const constraintsPass = cr.results.every((r) => r.passed); const composite = evaluation.aggregate.composite; const scoreDelta = composite - priorComposite; const accepted = constraintsPass && scoreDelta > 0 && (testPassed === undefined ? true : testPassed);
-    const candidateRecord: CandidateRecord = { ...draft, candidateFullText: fullText, evaluation, executionTraces: cTraces, constraints: cr.results, warnings: cr.warnings, semanticDriftScore: driftScore, testPassed, gateResults };
-    const iterRecord: IterationRecord = { iteration: iter, parentCandidate: parentName, mutationRationale: draft.rationale, reflectionPrompt: reflection, candidate: { name: draft.name, rationale: draft.rationale, candidateBody: draft.candidateBody }, evaluation, traces: cTraces, scoreDelta, accepted, gateResults };
+    const constraintsPass = cr.results.every((r) => r.passed); const composite = evaluation.aggregate.composite;
+    const scoreDelta = composite - mean(parent.validationScores);
+    // "Accepted" now means "cleared constraints/test gate on a full validation pass" — it is
+    // added to the Pareto pool regardless of whether its aggregate beats the parent, because the
+    // pool wants diverse per-instance strengths to sample from, not just a chain of monotone wins.
+    const accepted = constraintsPass && (testPassed === undefined ? true : testPassed);
+    const candidateRecord: CandidateRecord = { ...draft, candidateFullText: fullText, evaluation, executionTraces: cTraces, constraints: cr.results, warnings: cr.warnings, semanticDriftScore: driftScore, testPassed, gateResults, parentCandidate: parentLabel, selectionMethod, minibatchScore };
+    const iterRecord: IterationRecord = { iteration: iter, parentCandidate: parentLabel, mutationRationale: draft.rationale, reflectionPrompt: recordedReflection, candidate: { name: draft.name, rationale: draft.rationale, candidateBody: draft.candidateBody }, evaluation, traces: cTraces, scoreDelta, accepted, gateResults, selectionMethod, paretoFrontierSize: reportedFrontierSize, minibatchFiltered: false };
     iterations.push(iterRecord); await safeWriteFile(path.join(runDir, "iterations", `${iter}.json`), JSON.stringify({ ...iterRecord, candidateFullText: fullText, constraints: cr.results, warnings: cr.warnings, semanticDriftScore: driftScore, testPassed, gateResults }, null, 2));
-    if (accepted) { candidates.push(candidateRecord); parentName = draft.name; priorComposite = composite; }
-    else { options.onProgress?.("iteration", `${iter} rejected: delta=${scoreDelta.toFixed(3)} constraints=${constraintsPass} test=${testPassed ?? "n/a"}`); }
-    priorTraces = cTraces; priorEvaluation = evaluation;
+    if (accepted) {
+      candidates.push(candidateRecord);
+      pool.push({ name: draft.name, body: draft.candidateBody, fullText, validationScores: evaluation.examples.map((e) => e.composite), minibatchScore, traces: cTraces, evaluation });
+    } else {
+      options.onProgress?.("iteration", `${iter} rejected: constraints=${constraintsPass} test=${testPassed ?? "n/a"}`);
+    }
   }
   if (candidates.length === 0) {
-    // Fallback: take the iteration with the best validation composite even if not strictly accepted.
-    if (iterations.length === 0) throw new Error("Iterative loop produced no candidates.");
-    const best = [...iterations].sort((a, b) => b.evaluation.aggregate.composite - a.evaluation.aggregate.composite)[0]!;
+    // Fallback: take the best fully-validated iteration even if not strictly accepted, preferring
+    // real validation-set evaluations over minibatch-only ones (which never reached a full pass).
+    const fullyEvaluated = iterations.filter((it) => it.minibatchFiltered === false);
+    const pickFrom = fullyEvaluated.length > 0 ? fullyEvaluated : iterations;
+    if (pickFrom.length === 0) throw new Error("Iterative loop produced no candidates.");
+    const best = [...pickFrom].sort((a, b) => b.evaluation.aggregate.composite - a.evaluation.aggregate.composite)[0]!;
     const fullText = reassembleArtifact(target.frontmatter, best.candidate.candidateBody);
     const cr = validateConstraints(target, best.candidate.candidateBody, fullText, constraintConfig);
     options.onProgress?.("iterations", `Fallback acceptance: no iteration met strict criteria; promoting "${best.candidate.name}" (composite=${best.evaluation.aggregate.composite.toFixed(3)})`);
-    candidates.push({ ...best.candidate, candidateFullText: fullText, evaluation: best.evaluation, executionTraces: best.traces, constraints: cr.results, warnings: [...cr.warnings, "Fallback acceptance: no iteration met strict acceptance criteria."], semanticDriftScore: undefined, testPassed: undefined, wasFallbackPromoted: true, gateResults: best.gateResults });
+    candidates.push({ ...best.candidate, candidateFullText: fullText, evaluation: best.evaluation, executionTraces: best.traces, constraints: cr.results, warnings: [...cr.warnings, "Fallback acceptance: no iteration met strict acceptance criteria."], semanticDriftScore: undefined, testPassed: undefined, wasFallbackPromoted: true, gateResults: best.gateResults, parentCandidate: best.parentCandidate, selectionMethod: best.selectionMethod });
   }
   candidates.sort((a, b) => b.evaluation.aggregate.composite - a.evaluation.aggregate.composite);
   const bestCandidate = candidates[0]!;
+  const finalFrontier = computeParetoFrontier(pool).frontier.map((p) => p.name);
   options.onProgress?.("confirm", `${bestCandidate.name} on holdout`);
   const { evaluation: bestHoldoutEvaluation, traces: bestHoldoutTraces } = await evaluateArtifact({
     cwd: options.cwd,
@@ -590,6 +777,9 @@ async function runTypeScriptEvolution(options: {
     baselineTraces,
     prResult,
     iterations,
+    paretoFrontier: finalFrontier,
+    mergeAttempts,
+    minibatchFilteredCount,
   };
 
   options.onProgress?.("write", "Writing artifacts");
@@ -629,7 +819,15 @@ async function runTypeScriptEvolution(options: {
       semanticDriftScore: c.semanticDriftScore,
       testPassed: c.testPassed,
       constraintsPassed: c.constraints.every((x) => x.passed),
+      parentCandidate: c.parentCandidate ?? null,
+      selectionMethod: c.selectionMethod ?? "mutation",
     })),
+    optimization: {
+      strategy: "gepa-pareto",
+      paretoFrontier: finalFrontier,
+      mergeAttempts,
+      minibatchFilteredCount,
+    },
     traces: { baselineCount: baselineTraces.length },
     prBranch: prResult?.branch ?? null,
     createdAt: new Date().toISOString(),
@@ -694,7 +892,7 @@ export function buildToolSummary(r: EvolutionSummaryDetails): string {
 
 export function toToolSummaryDetails(result: EvolutionRunResult): EvolutionSummaryDetails {
   const allTraces = [...result.baselineTraces, ...result.candidates.flatMap((c) => c.executionTraces)];
-  return { runDir: result.paths.runDir, reportPath: result.paths.reportPath, targetPath: result.target.path, objective: result.objective, evalSource: result.evalSource, modelLabel: result.modelLabel, selectionSplit: result.selectionSplit, confirmationSplit: result.confirmationSplit, trainExamples: result.trainExamples.length, validationExamples: result.validationExamples.length, holdoutExamples: result.holdoutExamples.length, goldenTaskId: result.golden?.id ?? null, candidateCount: result.candidates.length, baselineValidationScore: result.baselineValidation.aggregate.composite, bestValidationScore: result.bestCandidate.evaluation.aggregate.composite, baselineHoldoutScore: result.baselineHoldout.aggregate.composite, bestHoldoutScore: result.bestCandidate.holdoutEvaluation?.aggregate.composite ?? result.bestCandidate.evaluation.aggregate.composite, improvement: result.improvement, bestCandidateName: result.bestCandidate.name, tracesCaptured: allTraces.length, constraintsPassed: result.bestCandidate.constraints.length > 0 ? result.bestCandidate.constraints.every((c) => c.passed) : true, testGatePassed: result.bestCandidate.testPassed, semanticDriftScore: result.bestCandidate.semanticDriftScore, prBranch: result.prResult?.branch, backend: "typescript", optimizerUsed: "gepa-iterative" };
+  return { runDir: result.paths.runDir, reportPath: result.paths.reportPath, targetPath: result.target.path, objective: result.objective, evalSource: result.evalSource, modelLabel: result.modelLabel, selectionSplit: result.selectionSplit, confirmationSplit: result.confirmationSplit, trainExamples: result.trainExamples.length, validationExamples: result.validationExamples.length, holdoutExamples: result.holdoutExamples.length, goldenTaskId: result.golden?.id ?? null, candidateCount: result.candidates.length, baselineValidationScore: result.baselineValidation.aggregate.composite, bestValidationScore: result.bestCandidate.evaluation.aggregate.composite, baselineHoldoutScore: result.baselineHoldout.aggregate.composite, bestHoldoutScore: result.bestCandidate.holdoutEvaluation?.aggregate.composite ?? result.bestCandidate.evaluation.aggregate.composite, improvement: result.improvement, bestCandidateName: result.bestCandidate.name, tracesCaptured: allTraces.length, constraintsPassed: result.bestCandidate.constraints.length > 0 ? result.bestCandidate.constraints.every((c) => c.passed) : true, testGatePassed: result.bestCandidate.testPassed, semanticDriftScore: result.bestCandidate.semanticDriftScore, prBranch: result.prResult?.branch, backend: "typescript", optimizerUsed: "gepa-pareto" };
 }
 
 export type { EvolutionSummaryDetails, ToolSummaryDetails } from "./types.js";

@@ -22,6 +22,8 @@ export const EXPECTED_PARITY_ROWS: ParityRow[] = [
   { capability: "Optional test-command gate", status: "complete", evidence: "src/engine.ts" },
   { capability: "Optional PR automation", status: "complete", evidence: "src/engine.ts" },
   { capability: "Iterative reflective loop", status: "complete", evidence: "src/engine.ts iterations/" },
+  { capability: "Pareto-frontier candidate pool", status: "complete", evidence: "src/engine.ts" },
+  { capability: "System-aware merge", status: "complete", evidence: "src/engine.ts" },
   { capability: "Pi-native executor", status: "complete", evidence: "src/pi-executor.ts" },
   { capability: "Tiered regression gate", status: "complete", evidence: "src/tiered-gate.ts" },
   { capability: "SKILL.md structural validator", status: "complete", evidence: "src/constraints-structure.ts" },
