@@ -150,8 +150,12 @@ export interface CandidateRecord extends CandidateDraft {
    * degenerate "winner" promotion without spelunking `warnings`.
    */
   wasFallbackPromoted?: boolean;
-  /** Name of the pool member this candidate was mutated (or merged) from. Undefined for the baseline itself. */
-  parentCandidate?: string;
+  /**
+   * Names of the pool member(s) this candidate was derived from: one entry for a mutation,
+   * two for a merge (in `a, b` order as passed to `generateMergeCandidateDraft`). Undefined
+   * for the baseline itself.
+   */
+  parentCandidates?: string[];
   /** How this candidate's draft was produced: reflective mutation of a Pareto-selected parent, or a merge of two frontier candidates. */
   selectionMethod?: "mutation" | "merge";
   /** Composite judge score on the cheap train-set minibatch, used as the pre-filter gate before a full validation pass. */
@@ -240,7 +244,10 @@ export interface ReflectionPrompt {
 
 export interface IterationRecord {
   iteration: number;
+  /** Primary parent's pool name (the mutation parent, or the first merge input). Kept for backward compatibility; see `parentCandidates` for the full lineage. */
   parentCandidate?: string;
+  /** Full lineage: one entry for a mutation, two (`a`, `b`) for a merge. */
+  parentCandidates?: string[];
   mutationRationale: string;
   reflectionPrompt: ReflectionPrompt;
   candidate: CandidateDraft;
@@ -251,7 +258,7 @@ export interface IterationRecord {
   gateResults?: TieredGateResult[];
   /** How the draft evaluated in this iteration was produced. */
   selectionMethod?: "mutation" | "merge";
-  /** Size of the Pareto frontier the parent was sampled from (mutation only). */
+  /** Size of the Pareto frontier at selection time: the mutation-parent sampling pool for a mutation, or the frontier a merge's two inputs were drawn from. */
   paretoFrontierSize?: number;
   /**
    * True when the candidate was rejected by the cheap minibatch pre-filter

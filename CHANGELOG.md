@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### GEPA-Pareto review fixes
+
+Addresses CodeRabbit review findings on the GEPA-Pareto PR:
+
+- fix merge candidates being minibatch-filtered and score-deltaed against an unrelated sampled `parent` instead of their actual merge inputs `a`/`b`; the comparison baseline is now the stronger of the two merge parents
+- fail closed instead of silently skipping when the tiered gate itself throws (as opposed to a tier resolving `passed: false`, which `runTieredGate` already handles internally) — an exception now rejects the iteration rather than letting the candidate through unchecked
+- fix the no-fully-evaluated-candidate fallback promoting a draft under its parent's (or a partial minibatch) score; it now only promotes from iterations that completed a real full-validation pass on themselves, and retains the baseline (with baseline's own genuine evaluation) rather than misattributing a score when nothing did
+- `CandidateRecord`/`IterationRecord` gain `parentCandidates?: string[]` (replacing the synthetic `"a+b"` string lineage for merges) alongside the existing single-parent `IterationRecord.parentCandidate` for backward compatibility
+- `tests/parity.test.ts` now parses the README parity table's status/evidence columns per row instead of a whole-section substring check, and rejects duplicate capability rows
+
 ### GEPA-Pareto upgrade to the reflective loop
 
 Aligns the iterative loop in `src/engine.ts` with GEPA ("Reflective Prompt Evolution Can Outperform Reinforcement Learning", arXiv:2507.19457) — the current state-of-the-art reflective/evolutionary prompt optimizer, which this package's `optimizerUsed` label already claimed lineage from without implementing the algorithm's core mechanisms.

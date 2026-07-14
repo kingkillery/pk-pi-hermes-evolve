@@ -47,15 +47,60 @@ function stripMarkdown(text: string): string {
   return text.replace(/\*\*/g, "").replace(/`/g, "");
 }
 
+interface ParsedParityRow {
+  capability: string;
+  status: "complete" | "optional" | "missing";
+  evidence: string;
+}
+
+/**
+ * Parses the README's `| Capability | Status | Where |` table into rows so the gate can check
+ * status/evidence per row, not just "does this capability name appear anywhere in the section"
+ * (which would pass even for a row marked ❌ or pointing at empty evidence).
+ */
+function parseParityTableRows(section: string): ParsedParityRow[] {
+  const rows: ParsedParityRow[] = [];
+  for (const line of section.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("|") || !trimmed.endsWith("|")) continue;
+    const cells = trimmed.slice(1, -1).split("|").map((c) => c.trim());
+    if (cells.length < 3) continue;
+    const [capabilityRaw, statusRaw, evidenceRaw] = cells;
+    if (/^:?-+:?$/.test(capabilityRaw)) continue; // "|---|---|---|" separator row
+    if (capabilityRaw.toLowerCase() === "capability") continue; // header row
+    const status: ParsedParityRow["status"] = statusRaw.includes("✅") ? "complete" : statusRaw.includes("🟦") ? "optional" : "missing";
+    rows.push({ capability: stripMarkdown(capabilityRaw), status, evidence: stripMarkdown(evidenceRaw) });
+  }
+  return rows;
+}
+
 export function runParityGate(): { ok: true; rowsChecked: number } {
-  const section = stripMarkdown(readParityTableFromReadme());
+  const rawSection = readParityTableFromReadme();
+  const section = stripMarkdown(rawSection);
+  const parsedRows = parseParityTableRows(rawSection);
+
   const missing: string[] = [];
+  const invalid: string[] = [];
   for (const row of EXPECTED_PARITY_ROWS) {
-    if (!section.includes(stripMarkdown(row.capability))) missing.push(row.capability);
+    const match = parsedRows.find((r) => r.capability.includes(row.capability));
+    if (!match) { missing.push(row.capability); continue; }
+    if (match.status !== row.status) invalid.push(`${row.capability}: expected status "${row.status}", README row shows "${match.status}" ("${match.capability}")`);
+    if (match.evidence.trim().length === 0) invalid.push(`${row.capability}: README row has an empty evidence ("Where") column`);
   }
   if (missing.length > 0) {
     throw new Error(`README parity table is missing rows: ${missing.join("; ")}`);
   }
+  if (invalid.length > 0) {
+    throw new Error(`README parity table has invalid rows: ${invalid.join("; ")}`);
+  }
+
+  const seen = new Map<string, number>();
+  for (const row of parsedRows) seen.set(row.capability, (seen.get(row.capability) ?? 0) + 1);
+  const duplicates = [...seen.entries()].filter(([, count]) => count > 1).map(([capability]) => capability);
+  if (duplicates.length > 0) {
+    throw new Error(`README parity table has duplicate capability rows: ${duplicates.join("; ")}`);
+  }
+
   const regressedSurplus: string[] = [];
   if (section.includes("typescript-proxy")) regressedSurplus.push("'typescript-proxy' framing leaked back into README");
   if (section.includes("not a full Hermes reproduction")) regressedSurplus.push("framing regressed to 'not a reproduction'");

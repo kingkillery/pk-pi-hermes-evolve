@@ -519,7 +519,7 @@ function buildReportMarkdown(result: EvolutionRunResult): string {
     "## Baseline weaknesses", summarizeWeaknesses(result.baselineTrain, 3), "",
     "## Execution traces", `- Total: ${totalTraces}`, `- Failures: ${failures.length}`, ...failures.slice(0, 5).map((t, i) => `${i + 1}. [${t.traceId}] composite=${t.scores.composite.toFixed(2)} — ${t.feedback.slice(0, 120)}`), "",
     "## Candidates", "| Name | Parent | Method | Validation | Holdout | Correctness | Procedure | Conciseness | Constraints | Drift |", "|---|---|---|---:|---:|---:|---:|---:|---|---|",
-    ...result.candidates.map((c) => `| ${c.name} | ${c.parentCandidate ?? "—"} | ${c.selectionMethod ?? "mutation"} | ${c.evaluation.aggregate.composite.toFixed(3)} | ${c.holdoutEvaluation?.aggregate.composite.toFixed(3) ?? "—"} | ${c.evaluation.aggregate.correctness.toFixed(3)} | ${c.evaluation.aggregate.procedureFollowing.toFixed(3)} | ${c.evaluation.aggregate.conciseness.toFixed(3)} | ${c.constraints.every((x) => x.passed) ? "✅" : "❌"} | ${c.semanticDriftScore?.toFixed(2) ?? "—"} |`),
+    ...result.candidates.map((c) => `| ${c.name} | ${c.parentCandidates && c.parentCandidates.length > 0 ? c.parentCandidates.join(" + ") : "—"} | ${c.selectionMethod ?? "mutation"} | ${c.evaluation.aggregate.composite.toFixed(3)} | ${c.holdoutEvaluation?.aggregate.composite.toFixed(3) ?? "—"} | ${c.evaluation.aggregate.correctness.toFixed(3)} | ${c.evaluation.aggregate.procedureFollowing.toFixed(3)} | ${c.evaluation.aggregate.conciseness.toFixed(3)} | ${c.constraints.every((x) => x.passed) ? "✅" : "❌"} | ${c.semanticDriftScore?.toFixed(2) ?? "—"} |`),
     "",
     "## Best candidate", `- **Name:** ${result.bestCandidate.name}`, `- **Rationale:** ${result.bestCandidate.rationale}`,
     ...result.bestCandidate.constraints.map((c) => `- ${c.passed ? "✅" : "❌"} **${c.name}**: ${c.message}`),
@@ -604,7 +604,12 @@ async function runTypeScriptEvolution(options: {
     const { parent, frontierSize } = selectParetoParent(pool, paretoRng);
     const parentReflection = buildReflectionPrompt(options.objective, parent.traces, parent.evaluation);
     let draft: CandidateDraft | undefined; let selectionMethod: "mutation" | "merge" = "mutation";
-    let parentLabel = parent.name; let recordedReflection: ReflectionPrompt = parentReflection; let reportedFrontierSize = frontierSize;
+    let parentNames: string[] = [parent.name]; let recordedReflection: ReflectionPrompt = parentReflection; let reportedFrontierSize = frontierSize;
+    // Comparison baseline for the minibatch filter and scoreDelta: the sampled mutation `parent`
+    // for a mutation draft, or the stronger of the two merge inputs for a merge draft (a merge
+    // must be compared against what it was actually built from, not an unrelated sampled parent).
+    let comparisonMinibatchScore = parent.minibatchScore;
+    let comparisonValidationScore = mean(parent.validationScores);
 
     // Merge eligibility uses distinct FRONTIER MEMBERS (not a persistent lineage id): mutation
     // children are pool entries in their own right, each a candidate "lineage tip" with its own
@@ -616,7 +621,9 @@ async function runTypeScriptEvolution(options: {
         options.onProgress?.("iteration", `${iter}/${iterationCount} merge ${a.name} + ${b.name}`);
         try {
           draft = await generateMergeCandidateDraft({ cwd: options.cwd, model: options.model, thinkingLevel: options.thinkingLevel, target, objective: options.objective, a, b, maxBytes, iteration: iter, signal: options.signal });
-          selectionMethod = "merge"; mergeAttempts += 1; parentLabel = `${a.name}+${b.name}`; reportedFrontierSize = frontier.length;
+          selectionMethod = "merge"; mergeAttempts += 1; parentNames = [a.name, b.name]; reportedFrontierSize = frontier.length;
+          comparisonMinibatchScore = Math.max(a.minibatchScore, b.minibatchScore);
+          comparisonValidationScore = Math.max(mean(a.validationScores), mean(b.validationScores));
           recordedReflection = { priorTraces: [], priorJudgeFeedback: [], objective: options.objective, weaknessSummary: `System-aware merge of Pareto-frontier candidates "${a.name}" and "${b.name}".` };
         } catch (err) { options.onProgress?.("iteration", `${iter} merge skipped: ${err instanceof Error ? err.message : String(err)}`); }
       }
@@ -631,7 +638,7 @@ async function runTypeScriptEvolution(options: {
     const fullText = reassembleArtifact(target.frontmatter, draft.candidateBody);
     const cr = validateConstraints(target, draft.candidateBody, fullText, constraintConfig);
     if (!cr.valid) {
-      const iterRecord: IterationRecord = { iteration: iter, parentCandidate: parentLabel, mutationRationale: draft.rationale, reflectionPrompt: recordedReflection, candidate: { name: draft.name, rationale: draft.rationale, candidateBody: draft.candidateBody }, evaluation: parent.evaluation, traces: [], scoreDelta: 0, accepted: false, selectionMethod, paretoFrontierSize: reportedFrontierSize };
+      const iterRecord: IterationRecord = { iteration: iter, parentCandidate: parentNames[0], parentCandidates: parentNames, mutationRationale: draft.rationale, reflectionPrompt: recordedReflection, candidate: { name: draft.name, rationale: draft.rationale, candidateBody: draft.candidateBody }, evaluation: parent.evaluation, traces: [], scoreDelta: 0, accepted: false, selectionMethod, paretoFrontierSize: reportedFrontierSize };
       iterations.push(iterRecord);
       await safeWriteFile(path.join(runDir, "iterations", `${iter}.json`), JSON.stringify({ ...iterRecord, candidateFullText: fullText, constraints: cr.results, warnings: cr.warnings }, null, 2));
       options.onProgress?.("iteration", `${iter} rejected: constraints failed`);
@@ -640,8 +647,12 @@ async function runTypeScriptEvolution(options: {
 
     // Tiered regression gate (typecheck → cohort → coherence) runs first: it's cheap (no judge
     // LLM calls beyond an optional injected callback) and orthogonal to draft quality, so a
-    // failing tier should short-circuit before paying for judge/executor rollouts at all.
+    // failing tier should short-circuit before paying for judge/executor rollouts at all. An
+    // exception from the gate itself (as opposed to a tier resolving passed:false, which
+    // runTieredGate already handles internally) is treated as a rejection, not a silent skip —
+    // letting a candidate through because the safety check errored would defeat the gate.
     let gateResults: TieredGateResult[] | undefined;
+    let gateError: string | undefined;
     try {
       gateResults = await runTieredGate({
         cwd: options.cwd,
@@ -653,10 +664,17 @@ async function runTypeScriptEvolution(options: {
         tsConfigPath: options.tsConfigPath,
         baselineScore: baselineHoldout.aggregate.composite,
       });
-    } catch { /* gate unavailable; skip */ }
+    } catch (err) { gateError = err instanceof Error ? err.message : String(err); }
+    if (gateError !== undefined) {
+      const iterRecord: IterationRecord = { iteration: iter, parentCandidate: parentNames[0], parentCandidates: parentNames, mutationRationale: draft.rationale, reflectionPrompt: recordedReflection, candidate: { name: draft.name, rationale: draft.rationale, candidateBody: draft.candidateBody }, evaluation: parent.evaluation, traces: [], scoreDelta: 0, accepted: false, selectionMethod, paretoFrontierSize: reportedFrontierSize };
+      iterations.push(iterRecord);
+      await safeWriteFile(path.join(runDir, "iterations", `${iter}.json`), JSON.stringify({ ...iterRecord, candidateFullText: fullText, constraints: cr.results, warnings: [...cr.warnings, `Tiered gate execution error: ${gateError}`] }, null, 2));
+      options.onProgress?.("iteration", `${iter} rejected: tiered gate execution error: ${gateError}`);
+      continue;
+    }
     if (gateResults && gateResults.some((r) => !r.passed)) {
       const failedTier = gateResults.find((r) => !r.passed)!;
-      const iterRecord: IterationRecord = { iteration: iter, parentCandidate: parentLabel, mutationRationale: draft.rationale, reflectionPrompt: recordedReflection, candidate: { name: draft.name, rationale: draft.rationale, candidateBody: draft.candidateBody }, evaluation: parent.evaluation, traces: [], scoreDelta: 0, accepted: false, selectionMethod, paretoFrontierSize: reportedFrontierSize, gateResults };
+      const iterRecord: IterationRecord = { iteration: iter, parentCandidate: parentNames[0], parentCandidates: parentNames, mutationRationale: draft.rationale, reflectionPrompt: recordedReflection, candidate: { name: draft.name, rationale: draft.rationale, candidateBody: draft.candidateBody }, evaluation: parent.evaluation, traces: [], scoreDelta: 0, accepted: false, selectionMethod, paretoFrontierSize: reportedFrontierSize, gateResults };
       iterations.push(iterRecord);
       await safeWriteFile(path.join(runDir, "iterations", `${iter}.json`), JSON.stringify({ ...iterRecord, candidateFullText: fullText, constraints: cr.results, warnings: cr.warnings, gateResults }, null, 2));
       options.onProgress?.("iteration", `${iter} rejected: tiered gate failed at "${failedTier.tier}" (${failedTier.reasonCode})`);
@@ -664,18 +682,20 @@ async function runTypeScriptEvolution(options: {
     }
 
     // Minibatch pre-filter: judge on a cheap 1-2 example train subset before paying for a full
-    // validation pass with the real pi executor. Only reject a CLEAR regression vs. the parent on
-    // the same subset — ties proceed, since a 1-2 example judge score is noisy and a tie carries
-    // no real signal to reject on. This is GEPA's main lever for the "35x fewer rollouts" result.
+    // validation pass with the real pi executor. Only reject a CLEAR regression vs. the comparison
+    // baseline on the same subset — ties proceed, since a 1-2 example judge score is noisy and a
+    // tie carries no real signal to reject on. This is GEPA's main lever for the "35x fewer
+    // rollouts" result. The comparison baseline is the sampled parent for a mutation, or the
+    // stronger of the two merge inputs for a merge (see comparisonMinibatchScore above).
     options.onProgress?.("iteration", `${iter} minibatch pre-filter`);
     const { evaluation: minibatchEval, traces: minibatchTraces } = await evaluateArtifact({ cwd: options.cwd, model: options.model, thinkingLevel: options.thinkingLevel, target, artifactText: fullText, objective: options.objective, examples: minibatch, maxBytes, signal: options.signal });
     const minibatchScore = minibatchEval.aggregate.composite;
-    if (minibatchScore < parent.minibatchScore - 1e-9) {
+    if (minibatchScore < comparisonMinibatchScore - 1e-9) {
       minibatchFilteredCount += 1;
-      const iterRecord: IterationRecord = { iteration: iter, parentCandidate: parentLabel, mutationRationale: draft.rationale, reflectionPrompt: recordedReflection, candidate: { name: draft.name, rationale: draft.rationale, candidateBody: draft.candidateBody }, evaluation: minibatchEval, traces: minibatchTraces, scoreDelta: minibatchScore - parent.minibatchScore, accepted: false, selectionMethod, paretoFrontierSize: reportedFrontierSize, minibatchFiltered: true, gateResults };
+      const iterRecord: IterationRecord = { iteration: iter, parentCandidate: parentNames[0], parentCandidates: parentNames, mutationRationale: draft.rationale, reflectionPrompt: recordedReflection, candidate: { name: draft.name, rationale: draft.rationale, candidateBody: draft.candidateBody }, evaluation: minibatchEval, traces: minibatchTraces, scoreDelta: minibatchScore - comparisonMinibatchScore, accepted: false, selectionMethod, paretoFrontierSize: reportedFrontierSize, minibatchFiltered: true, gateResults };
       iterations.push(iterRecord);
       await safeWriteFile(path.join(runDir, "iterations", `${iter}.json`), JSON.stringify({ ...iterRecord, candidateFullText: fullText, constraints: cr.results, warnings: cr.warnings, gateResults }, null, 2));
-      options.onProgress?.("iteration", `${iter} minibatch-filtered: ${minibatchScore.toFixed(3)} < parent ${parent.minibatchScore.toFixed(3)}`);
+      options.onProgress?.("iteration", `${iter} minibatch-filtered: ${minibatchScore.toFixed(3)} < comparison baseline ${comparisonMinibatchScore.toFixed(3)}`);
       continue;
     }
 
@@ -700,13 +720,13 @@ async function runTypeScriptEvolution(options: {
       if (!tr.passed) cr.warnings.push(`Test failed (exit ${tr.exitCode})`);
     }
     const constraintsPass = cr.results.every((r) => r.passed); const composite = evaluation.aggregate.composite;
-    const scoreDelta = composite - mean(parent.validationScores);
+    const scoreDelta = composite - comparisonValidationScore;
     // "Accepted" now means "cleared constraints/test gate on a full validation pass" — it is
     // added to the Pareto pool regardless of whether its aggregate beats the parent, because the
     // pool wants diverse per-instance strengths to sample from, not just a chain of monotone wins.
     const accepted = constraintsPass && (testPassed === undefined ? true : testPassed);
-    const candidateRecord: CandidateRecord = { ...draft, candidateFullText: fullText, evaluation, executionTraces: cTraces, constraints: cr.results, warnings: cr.warnings, semanticDriftScore: driftScore, testPassed, gateResults, parentCandidate: parentLabel, selectionMethod, minibatchScore };
-    const iterRecord: IterationRecord = { iteration: iter, parentCandidate: parentLabel, mutationRationale: draft.rationale, reflectionPrompt: recordedReflection, candidate: { name: draft.name, rationale: draft.rationale, candidateBody: draft.candidateBody }, evaluation, traces: cTraces, scoreDelta, accepted, gateResults, selectionMethod, paretoFrontierSize: reportedFrontierSize, minibatchFiltered: false };
+    const candidateRecord: CandidateRecord = { ...draft, candidateFullText: fullText, evaluation, executionTraces: cTraces, constraints: cr.results, warnings: cr.warnings, semanticDriftScore: driftScore, testPassed, gateResults, parentCandidates: parentNames, selectionMethod, minibatchScore };
+    const iterRecord: IterationRecord = { iteration: iter, parentCandidate: parentNames[0], parentCandidates: parentNames, mutationRationale: draft.rationale, reflectionPrompt: recordedReflection, candidate: { name: draft.name, rationale: draft.rationale, candidateBody: draft.candidateBody }, evaluation, traces: cTraces, scoreDelta, accepted, gateResults, selectionMethod, paretoFrontierSize: reportedFrontierSize, minibatchFiltered: false };
     iterations.push(iterRecord); await safeWriteFile(path.join(runDir, "iterations", `${iter}.json`), JSON.stringify({ ...iterRecord, candidateFullText: fullText, constraints: cr.results, warnings: cr.warnings, semanticDriftScore: driftScore, testPassed, gateResults }, null, 2));
     if (accepted) {
       candidates.push(candidateRecord);
@@ -716,16 +736,39 @@ async function runTypeScriptEvolution(options: {
     }
   }
   if (candidates.length === 0) {
-    // Fallback: take the best fully-validated iteration even if not strictly accepted, preferring
-    // real validation-set evaluations over minibatch-only ones (which never reached a full pass).
+    // Fallback: take the best fully-validated iteration even if not strictly accepted. Only
+    // `minibatchFiltered === false` records carry a genuine evaluation of the DRAFT ITSELF —
+    // constraint/gate rejections and minibatch-filtered records store the PARENT's (or a
+    // partial) evaluation on the iterRecord, so promoting one of those would present a body
+    // under a score that was never actually measured for it.
     const fullyEvaluated = iterations.filter((it) => it.minibatchFiltered === false);
-    const pickFrom = fullyEvaluated.length > 0 ? fullyEvaluated : iterations;
-    if (pickFrom.length === 0) throw new Error("Iterative loop produced no candidates.");
-    const best = [...pickFrom].sort((a, b) => b.evaluation.aggregate.composite - a.evaluation.aggregate.composite)[0]!;
-    const fullText = reassembleArtifact(target.frontmatter, best.candidate.candidateBody);
-    const cr = validateConstraints(target, best.candidate.candidateBody, fullText, constraintConfig);
-    options.onProgress?.("iterations", `Fallback acceptance: no iteration met strict criteria; promoting "${best.candidate.name}" (composite=${best.evaluation.aggregate.composite.toFixed(3)})`);
-    candidates.push({ ...best.candidate, candidateFullText: fullText, evaluation: best.evaluation, executionTraces: best.traces, constraints: cr.results, warnings: [...cr.warnings, "Fallback acceptance: no iteration met strict acceptance criteria."], semanticDriftScore: undefined, testPassed: undefined, wasFallbackPromoted: true, gateResults: best.gateResults, parentCandidate: best.parentCandidate, selectionMethod: best.selectionMethod });
+    if (fullyEvaluated.length > 0) {
+      const best = [...fullyEvaluated].sort((a, b) => b.evaluation.aggregate.composite - a.evaluation.aggregate.composite)[0]!;
+      const fullText = reassembleArtifact(target.frontmatter, best.candidate.candidateBody);
+      const cr = validateConstraints(target, best.candidate.candidateBody, fullText, constraintConfig);
+      options.onProgress?.("iterations", `Fallback acceptance: no iteration met strict criteria; promoting "${best.candidate.name}" (composite=${best.evaluation.aggregate.composite.toFixed(3)})`);
+      candidates.push({ ...best.candidate, candidateFullText: fullText, evaluation: best.evaluation, executionTraces: best.traces, constraints: cr.results, warnings: [...cr.warnings, "Fallback acceptance: no iteration met strict acceptance criteria."], semanticDriftScore: undefined, testPassed: undefined, wasFallbackPromoted: true, gateResults: best.gateResults, parentCandidates: best.parentCandidates, selectionMethod: best.selectionMethod });
+    } else {
+      // Nothing this run ever cleared constraints, the tiered gate, or the minibatch filter for a
+      // full validation pass — every candidate() would be a body that was never actually measured
+      // at the score we'd have to borrow from its parent to report. Rather than promote a
+      // mislabeled draft (or throw and abort the whole multi-iteration run over one bad artifact),
+      // retain the baseline itself: its `baselineValidation` evaluation is genuine, and the
+      // holdout confirmation step below will naturally report ~0 improvement.
+      const cr = validateConstraints(target, target.body, target.fullText, constraintConfig);
+      options.onProgress?.("iterations", "Fallback: no iteration passed constraints, the tiered gate, or the minibatch filter; retaining baseline.");
+      candidates.push({
+        name: "baseline",
+        rationale: "No mutation or merge this run cleared constraints, the tiered gate, or the minibatch pre-filter; baseline retained unchanged.",
+        candidateBody: target.body,
+        candidateFullText: target.fullText,
+        evaluation: baselineValidation,
+        executionTraces: [],
+        constraints: cr.results,
+        warnings: [...cr.warnings, "Fallback acceptance: no iteration passed constraints/gates/minibatch filter this run."],
+        wasFallbackPromoted: true,
+      });
+    }
   }
   candidates.sort((a, b) => b.evaluation.aggregate.composite - a.evaluation.aggregate.composite);
   const bestCandidate = candidates[0]!;
@@ -819,7 +862,7 @@ async function runTypeScriptEvolution(options: {
       semanticDriftScore: c.semanticDriftScore,
       testPassed: c.testPassed,
       constraintsPassed: c.constraints.every((x) => x.passed),
-      parentCandidate: c.parentCandidate ?? null,
+      parentCandidates: c.parentCandidates ?? [],
       selectionMethod: c.selectionMethod ?? "mutation",
     })),
     optimization: {
