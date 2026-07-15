@@ -8,7 +8,7 @@ import { mineSessionSnippets } from "./session-history.js";
 import { executeCandidateInPi } from "./pi-executor.js";
 import { runTieredGate } from "./tiered-gate.js";
 import { checkSkillStructure } from "./constraints-structure.js";
-import { appendLineageEntry, loadBestAncestor } from "./lineage.js";
+import { appendLineageEntry, loadBestAncestor, resolveAncestorBody } from "./lineage.js";
 import type {
   AggregateScore,
   ArtifactEvaluation,
@@ -309,13 +309,54 @@ function mulberry32(seed: number): () => number {
   };
 }
 
+/**
+ * Interleaves examples across difficulty groups (weighted-random pick of a non-empty group per
+ * step, using the caller's RNG stream) so a positional slice of the result gets a representative
+ * difficulty mix instead of risking an all-one-difficulty split from an unlucky plain shuffle.
+ */
+function stratifyByDifficulty(shuffled: EvalExample[], rng: () => number): EvalExample[] {
+  const groups = new Map<string, EvalExample[]>();
+  for (const ex of shuffled) {
+    const list = groups.get(ex.difficulty);
+    if (list) list.push(ex); else groups.set(ex.difficulty, [ex]);
+  }
+  if (groups.size <= 1) return shuffled;
+  const result: EvalExample[] = [];
+  for (let remaining = shuffled.length; remaining > 0; remaining -= 1) {
+    const nonEmptyKeys = [...groups.keys()].filter((k) => groups.get(k)!.length > 0);
+    const pick = nonEmptyKeys[Math.floor(rng() * nonEmptyKeys.length)]!;
+    result.push(groups.get(pick)!.shift()!);
+  }
+  return result;
+}
+
 function splitExamples(examples: EvalExample[], seed?: number): { train: EvalExample[]; validation: EvalExample[]; holdout: EvalExample[] } {
   const rng = seed !== undefined ? mulberry32(seed) : Math.random;
   const s = [...examples]; for (let i = s.length - 1; i > 0; i -= 1) { const j = Math.floor(rng() * (i + 1)); [s[i], s[j]] = [s[j]!, s[i]!]; }
-  const tc = Math.max(3, Math.ceil(s.length * 0.5)); const vc = Math.max(1, Math.floor(s.length * 0.2));
-  const train = s.slice(0, tc); const validation = s.slice(tc, tc + vc); const holdout = s.slice(tc + vc);
-  if (holdout.length === 0 && train.length > 2) holdout.push(train.pop()!);
-  if (validation.length === 0 && train.length > 2) validation.push(train.pop()!);
+
+  if (s.length <= 4) {
+    // Too few examples for a meaningful validation floor or stratification to matter, and this
+    // branch must stay byte-identical to the historical behavior the smoke harness's canned
+    // fixtures and deterministic seed (0xC0FFEE, maxExamples 4) were built against.
+    const tc = Math.max(3, Math.ceil(s.length * 0.5)); const vc = Math.max(1, Math.floor(s.length * 0.2));
+    const train = s.slice(0, tc); const validation = s.slice(tc, tc + vc); const holdout = s.slice(tc + vc);
+    if (holdout.length === 0 && train.length > 2) holdout.push(train.pop()!);
+    if (validation.length === 0 && train.length > 2) validation.push(train.pop()!);
+    return { train, validation, holdout };
+  }
+
+  // A validation floor of 1-2 instances makes Pareto-frontier candidate selection
+  // (computeParetoFrontier) degenerate to greedy argmax on a single noisy judge call, so once
+  // there's enough data, size-first-allocate holdout/validation (holdout >= 3 at n >= 8, matching
+  // the default maxExamples of 8) and give the remainder to train.
+  const n = s.length;
+  const holdoutCount = n >= 8 ? Math.max(3, Math.round(n * 0.3)) : Math.max(1, Math.round(n * 0.25));
+  const validationCount = n >= 8 ? 3 : 2;
+  const trainCount = Math.max(2, n - holdoutCount - validationCount);
+  const stratified = stratifyByDifficulty(s, rng);
+  const train = stratified.slice(0, trainCount);
+  const validation = stratified.slice(trainCount, trainCount + validationCount);
+  const holdout = stratified.slice(trainCount + validationCount);
   return { train, validation, holdout };
 }
 
@@ -333,8 +374,8 @@ function normalizeJudgeResult(payload: unknown): JudgeResult {
   return { responsePreview: String(r.responsePreview ?? r.response_preview ?? "").trim(), correctness: clampScore(r.correctness), procedureFollowing: clampScore(r.procedureFollowing ?? r.procedure_following), conciseness: clampScore(r.conciseness), feedback: String(r.feedback ?? "").trim(), confidence: clampScore(r.confidence ?? 0.6) };
 }
 
-function buildTrace(artifactText: string, example: EvalExample, judged: JudgeResult, composite: number, rawOutput: string): ExecutionTrace {
-  return { traceId: traceId(), artifactText: artifactText.slice(0, 2000), taskInput: example.taskInput, expectedBehavior: example.expectedBehavior, rawOutput: rawOutput.slice(0, 2000), responsePreview: judged.responsePreview.slice(0, 500), scores: { correctness: judged.correctness, procedureFollowing: judged.procedureFollowing, conciseness: judged.conciseness, composite }, feedback: judged.feedback, isFailure: composite < 0.5, timestamp: new Date().toISOString() };
+function buildTrace(artifactText: string, example: EvalExample, judged: JudgeResult, composite: number, rawOutput: string, hasRealExecution: boolean): ExecutionTrace {
+  return { traceId: traceId(), artifactText: artifactText.slice(0, 2000), taskInput: example.taskInput, expectedBehavior: example.expectedBehavior, rawOutput: rawOutput.slice(0, 2000), responsePreview: judged.responsePreview.slice(0, 500), scores: { correctness: judged.correctness, procedureFollowing: judged.procedureFollowing, conciseness: judged.conciseness, composite }, feedback: judged.feedback, isFailure: composite < 0.5, timestamp: new Date().toISOString(), hasRealExecution };
 }
 
 async function evaluateArtifact(options: { cwd: string; model?: string; thinkingLevel?: string; target: ArtifactTarget; artifactText: string; objective: string; examples: EvalExample[]; maxBytes: number; signal?: AbortSignal; onProgress?: (detail: string) => void; useRealExecutor?: boolean; executorLogDir?: string; artifactName?: string }): Promise<{ evaluation: ArtifactEvaluation; traces: ExecutionTrace[]; executorObservations?: ExecutionObservation[] }> {
@@ -350,12 +391,19 @@ async function evaluateArtifact(options: { cwd: string; model?: string; thinking
         if (options.executorLogDir) { const dir = path.join(options.executorLogDir, String(i)); await safeWriteFile(path.join(dir, "stdout.log"), observation.stdout); await safeWriteFile(path.join(dir, "stderr.log"), observation.stderr); await safeWriteFile(path.join(dir, "meta.json"), JSON.stringify({ exitCode: observation.exitCode, durationMs: observation.durationMs, taskInput: ex.taskInput }, null, 2)); }
       } catch (err) { executorContext = `\nExecutor unavailable: ${err instanceof Error ? err.message : String(err)}`; }
     }
-    const prompt = [`Artifact type: ${options.target.type}`, `Objective: ${options.objective}`, `Path: ${options.target.path}`, "", "Artifact text:", "```", options.artifactText.trim(), "```", "", `Task: ${ex.taskInput}`, `Rubric: ${ex.expectedBehavior}`, `Difficulty: ${ex.difficulty}`, `Category: ${ex.category}`, executorContext, "", 'Return JSON: {"responsePreview":"...","correctness":0.0,"procedureFollowing":0.0,"conciseness":0.0,"feedback":"...","confidence":0.0}'].join("\n");
+    // Blind the judge to the artifact's prose whenever we have a real observed transcript: score
+    // what the agent actually did, not how well the instructions read. Without a real observation
+    // (useRealExecutor off, or the executor call failed) fall back to judging the text itself.
+    const textBlock = observation ? [] : ["", "Artifact text:", "```", options.artifactText.trim(), "```"];
+    const scoringInstruction = observation
+      ? "Score the OBSERVED agent transcript above against the rubric — you do not have the artifact's instruction text, only what the agent actually did."
+      : "Score how well an agent following the artifact text above would likely satisfy the rubric.";
+    const prompt = [`Artifact type: ${options.target.type}`, `Objective: ${options.objective}`, `Path: ${options.target.path}`, ...textBlock, "", `Task: ${ex.taskInput}`, `Rubric: ${ex.expectedBehavior}`, `Difficulty: ${ex.difficulty}`, `Category: ${ex.category}`, executorContext, "", scoringInstruction, 'Return JSON: {"responsePreview":"...","correctness":0.0,"procedureFollowing":0.0,"conciseness":0.0,"feedback":"...","confidence":0.0}'].join("\n");
     const raw = await runPiTextTask({ cwd: options.cwd, model: options.model, thinkingLevel: options.thinkingLevel, systemPrompt: JUDGE_SYSTEM_PROMPT, prompt, signal: options.signal });
     const j = normalizeJudgeResult(extractJsonPayload(raw));
     if (observation && !j.responsePreview) j.responsePreview = observation.stdout.slice(0, 500);
     const c = 0.5 * j.correctness + 0.3 * j.procedureFollowing + 0.2 * j.conciseness;
-    evals.push({ example: ex, composite: c, ...j }); traces.push(buildTrace(options.artifactText, ex, j, c, observation ? observation.stdout : raw));
+    evals.push({ example: ex, composite: c, ...j }); traces.push(buildTrace(options.artifactText, ex, j, c, observation ? observation.stdout : raw, Boolean(observation)));
   }
   const n = Math.max(1, evals.length);
   const raw: AggregateScore = { correctness: evals.reduce((s, e) => s + e.correctness, 0) / n, procedureFollowing: evals.reduce((s, e) => s + e.procedureFollowing, 0) / n, conciseness: evals.reduce((s, e) => s + e.conciseness, 0) / n, confidence: evals.reduce((s, e) => s + e.confidence, 0) / n, lengthPenalty: 0, composite: evals.reduce((s, e) => s + e.composite, 0) / n };
@@ -454,7 +502,20 @@ function parseCandidateDraftPayload(raw: string, fallbackName: string): { name: 
 
 async function generateOneCandidateDraft(options: { cwd: string; model?: string; thinkingLevel?: string; target: ArtifactTarget; objective: string; trainExamples: EvalExample[]; reflection: ReflectionPrompt; maxBytes: number; iteration: number; parentName?: string; parentBody: string; signal?: AbortSignal }): Promise<CandidateDraft> {
   const failures = options.reflection.priorTraces.filter((t) => t.isFailure);
-  const traceSection = failures.length > 0 ? ["", "Observed failure traces (from the parent candidate below):", ...failures.slice(0, 5).map((t, i) => `  ${i + 1}. Task: ${t.taskInput}\n     Scores: correctness=${t.scores.correctness.toFixed(2)}, procedure=${t.scores.procedureFollowing.toFixed(2)}, composite=${t.scores.composite.toFixed(2)}\n     Feedback: ${t.feedback}`)].join("\n") : "";
+  // Surface real executor stdout (not judge JSON — the `hasRealExecution` gate matters: showing
+  // the judge's own speculative output as "what the agent did" would mislead the mutation rather
+  // than inform it) for the worst few failures, so the mutator can target the actual observed
+  // defect (wrong step order, missing action) instead of paraphrasing a one-line judge opinion.
+  let excerptsShown = 0;
+  const traceLines = failures.slice(0, 5).map((t, i) => {
+    const base = `  ${i + 1}. Task: ${t.taskInput}\n     Scores: correctness=${t.scores.correctness.toFixed(2)}, procedure=${t.scores.procedureFollowing.toFixed(2)}, composite=${t.scores.composite.toFixed(2)}\n     Feedback: ${t.feedback}`;
+    if (t.hasRealExecution && excerptsShown < 3) {
+      excerptsShown += 1;
+      return `${base}\n     Observed agent stdout (truncated): ${t.rawOutput.slice(0, 1200).replace(/\n/g, "\n       ")}`;
+    }
+    return base;
+  });
+  const traceSection = failures.length > 0 ? ["", "Observed failure traces (from the parent candidate below):", ...traceLines].join("\n") : "";
   const feedbackSection = options.reflection.priorJudgeFeedback.length > 0 ? ["", "Prior judge feedback to address:", ...options.reflection.priorJudgeFeedback.slice(0, 6).map((f, i) => `  ${i + 1}. ${f}`)].join("\n") : "";
   const parentSection = options.parentName ? `\nParent candidate: ${options.parentName} (this is the Pareto-frontier candidate selected to mutate; edit its BODY below, do not regress its gains).` : "\nParent candidate: <baseline>";
   const prompt = [`Iteration: ${options.iteration}`, `Artifact type: ${options.target.type}`, `Path: ${options.target.path}`, `Objective: ${options.objective}`, `Max bytes: ${options.maxBytes}`, `Placeholders: ${options.target.placeholders.length > 0 ? options.target.placeholders.join(", ") : "none"}`, `Top heading: ${options.target.topHeading ?? "none"}`, parentSection, "", "Parent BODY (mutate this, not the original):", "```", options.parentBody.trim(), "```", "", "Training tasks:", options.trainExamples.map((e, i) => `${i + 1}. ${e.taskInput}\n   Rubric: ${e.expectedBehavior}`).join("\n\n"), "", "Weaknesses (parent):", options.reflection.weaknessSummary, traceSection, feedbackSection, "", 'Return JSON: {"name":"short-kebab","rationale":"paragraph explaining mutation","candidateBody":"full revised body"}', "", "Rules: produce ONE revision of the parent BODY that targets its failure traces and judge feedback, preserve placeholders, keep markdown valid, never mention evaluation/scores."].join("\n");
@@ -568,15 +629,46 @@ async function runTypeScriptEvolution(options: {
   const golden = buildGoldenDataset(validation, options.goldenTaskId);
   if (golden && options.persistGolden !== false && !usedPersistedGolden) await saveGoldenDataset(options.cwd, golden, train, validation, holdout, target.path, target.name);
 
-  // Baseline evaluation with traces
+  // Baseline evaluation with traces. Holdout and validation are executor-grounded (not just
+  // train) because their scores feed the Pareto pool's baseline entry and the headline
+  // improvement number — those need to be measured under the same regime as candidates
+  // (which are always executor-grounded on validation, see the iteration loop below) or
+  // "improvement" is comparing judged prose against judged real behavior. Train stays
+  // judge-only: it only informs the baseline weakness summary/reflection, never a candidate
+  // comparison, so the regime doesn't need to match.
+  const baselineArtifactName = slugify(target.name) || "baseline";
   options.onProgress?.("baseline", "Train"); const { evaluation: baselineTrain, traces: btt } = await evaluateArtifact({ cwd: options.cwd, model: options.model, thinkingLevel: options.thinkingLevel, target, artifactText: target.fullText, objective: options.objective, examples: train, maxBytes, signal: options.signal, onProgress: (d) => options.onProgress?.("baseline", d) });
-  options.onProgress?.("baseline", "Holdout"); const { evaluation: baselineHoldout } = await evaluateArtifact({ cwd: options.cwd, model: options.model, thinkingLevel: options.thinkingLevel, target, artifactText: target.fullText, objective: options.objective, examples: holdout, maxBytes, signal: options.signal });
-  options.onProgress?.("baseline", "Validation"); const { evaluation: baselineValidation } = await evaluateArtifact({ cwd: options.cwd, model: options.model, thinkingLevel: options.thinkingLevel, target, artifactText: target.fullText, objective: options.objective, examples: validation, maxBytes, signal: options.signal });
+  options.onProgress?.("baseline", "Holdout"); const { evaluation: baselineHoldout } = await evaluateArtifact({ cwd: options.cwd, model: options.model, thinkingLevel: options.thinkingLevel, target, artifactText: target.fullText, objective: options.objective, examples: holdout, maxBytes, signal: options.signal, useRealExecutor: true, executorLogDir: path.join(runDir, "executor", "baseline-holdout"), artifactName: baselineArtifactName });
+  options.onProgress?.("baseline", "Validation"); const { evaluation: baselineValidation } = await evaluateArtifact({ cwd: options.cwd, model: options.model, thinkingLevel: options.thinkingLevel, target, artifactText: target.fullText, objective: options.objective, examples: validation, maxBytes, signal: options.signal, useRealExecutor: true, executorLogDir: path.join(runDir, "executor", "baseline-validation"), artifactName: baselineArtifactName });
   const baselineTraces = [...btt];
 
-  // Lineage: try to find best ancestor for this artifact path
+  // Lineage: try to find best ancestor for this artifact path, and — if its winning body is
+  // still hash-verifiable and would still pass the CURRENT baseline's constraints — resolve it
+  // for seeding the Pareto pool below. Without this, `loadBestAncestor`'s result was write-only
+  // (a progress log plus lineage parentRunId/parentArtifactHash chaining): run N+1 always started
+  // its search from the on-disk baseline, re-deriving whatever run N already found instead of
+  // building on it. Gated on hash verification (a human edit or pruned run invalidates it) and
+  // re-validated against the current target's constraints (frontmatter/placeholders/size may
+  // have changed on disk since that run).
   let ancestor: Awaited<ReturnType<typeof loadBestAncestor>> | undefined;
-  try { ancestor = await loadBestAncestor(options.cwd, target.path); if (ancestor) options.onProgress?.("lineage", `ancestor_id=${(ancestor as LineageEntry).runId ?? "unknown"} score=${((ancestor as LineageEntry).score ?? 0).toFixed(3)}`); } catch { /* sibling module unavailable */ }
+  let ancestorSeed: { body: string; fullText: string; entry: LineageEntry } | undefined;
+  try {
+    ancestor = await loadBestAncestor(options.cwd, target.path);
+    if (ancestor) {
+      options.onProgress?.("lineage", `ancestor_id=${ancestor.runId} score=${ancestor.score.toFixed(3)}`);
+      const ancestorFullText = await resolveAncestorBody(options.cwd, ancestor);
+      if (ancestorFullText && ancestorFullText !== target.fullText) {
+        const { body: ancestorBody } = splitFrontmatter(ancestorFullText);
+        const ancestorConstraints = validateConstraints(target, ancestorBody, ancestorFullText, constraintConfig);
+        if (ancestorConstraints.valid) {
+          ancestorSeed = { body: ancestorBody, fullText: ancestorFullText, entry: ancestor };
+          options.onProgress?.("lineage", "ancestor body hash-verified and constraint-valid; seeding pool");
+        } else {
+          options.onProgress?.("lineage", `ancestor body failed current constraints; not seeding (${ancestorConstraints.results.filter((r) => !r.passed).map((r) => r.name).join(", ")})`);
+        }
+      }
+    }
+  } catch { /* sibling module unavailable */ }
 
   // Iterative reflective loop, GEPA-Pareto style (arXiv:2507.19457): maintain a candidate pool
   // and select each iteration's mutation parent via Pareto-frontier sampling instead of a single
@@ -599,6 +691,24 @@ async function runTypeScriptEvolution(options: {
     traces: baselineTraces,
     evaluation: baselineTrain,
   }];
+  if (ancestorSeed) {
+    // Same evaluation regime as every other pool entry: executor-grounded validation score for
+    // Pareto bookkeeping, minibatch score/traces (judge-only, matching the mutation-parent
+    // filter reference and reflection source) for everything else.
+    options.onProgress?.("lineage", "Evaluating ancestor seed on validation");
+    const ancestorArtifactName = slugify(`ancestor-${ancestorSeed.entry.runId}`) || "ancestor";
+    const { evaluation: ancestorValidation } = await evaluateArtifact({ cwd: options.cwd, model: options.model, thinkingLevel: options.thinkingLevel, target, artifactText: ancestorSeed.fullText, objective: options.objective, examples: validation, maxBytes, signal: options.signal, useRealExecutor: true, executorLogDir: path.join(runDir, "executor", "ancestor-seed"), artifactName: ancestorArtifactName });
+    const { evaluation: ancestorMinibatch, traces: ancestorMinibatchTraces } = await evaluateArtifact({ cwd: options.cwd, model: options.model, thinkingLevel: options.thinkingLevel, target, artifactText: ancestorSeed.fullText, objective: options.objective, examples: minibatch, maxBytes, signal: options.signal });
+    pool.push({
+      name: "ancestor",
+      body: ancestorSeed.body,
+      fullText: ancestorSeed.fullText,
+      validationScores: ancestorValidation.examples.map((e) => e.composite),
+      minibatchScore: ancestorMinibatch.aggregate.composite,
+      traces: ancestorMinibatchTraces,
+      evaluation: ancestorMinibatch,
+    });
+  }
   const MERGE_EVERY = 3; const MAX_MERGE_ATTEMPTS = 2; let mergeAttempts = 0; let minibatchFilteredCount = 0;
   for (let iter = 1; iter <= iterationCount; iter += 1) {
     const { parent, frontierSize } = selectParetoParent(pool, paretoRng);
@@ -730,7 +840,15 @@ async function runTypeScriptEvolution(options: {
     iterations.push(iterRecord); await safeWriteFile(path.join(runDir, "iterations", `${iter}.json`), JSON.stringify({ ...iterRecord, candidateFullText: fullText, constraints: cr.results, warnings: cr.warnings, semanticDriftScore: driftScore, testPassed, gateResults }, null, 2));
     if (accepted) {
       candidates.push(candidateRecord);
-      pool.push({ name: draft.name, body: draft.candidateBody, fullText, validationScores: evaluation.examples.map((e) => e.composite), minibatchScore, traces: cTraces, evaluation });
+      // Pool entries feed future mutation/merge prompts via buildReflectionPrompt/summarizeWeaknesses
+      // (recordedReflection above, and generateMergeCandidateDraft's per-candidate weakness
+      // summaries). Store the MINIBATCH traces/evaluation here, not the validation-pass ones —
+      // validation is the selection split (computeParetoFrontier, winner ranking); if descendants
+      // are reflected against the exact instances used to select and rank them, they're optimized
+      // directly against the metric that judges them, inflating validation scores by construction.
+      // `validationScores` (used only for Pareto bookkeeping, never shown to the model) still
+      // comes from the real validation pass.
+      pool.push({ name: draft.name, body: draft.candidateBody, fullText, validationScores: evaluation.examples.map((e) => e.composite), minibatchScore, traces: minibatchTraces, evaluation: minibatchEval });
     } else {
       options.onProgress?.("iteration", `${iter} rejected: constraints=${constraintsPass} test=${testPassed ?? "n/a"}`);
     }
@@ -774,6 +892,9 @@ async function runTypeScriptEvolution(options: {
   const bestCandidate = candidates[0]!;
   const finalFrontier = computeParetoFrontier(pool).frontier.map((p) => p.name);
   options.onProgress?.("confirm", `${bestCandidate.name} on holdout`);
+  // Executor-grounded, matching baselineHoldout's regime above — `improvement` (below) is a
+  // difference of these two, and comparing a judged-real-behavior score against a judged-prose
+  // one would make the headline number meaningless.
   const { evaluation: bestHoldoutEvaluation, traces: bestHoldoutTraces } = await evaluateArtifact({
     cwd: options.cwd,
     model: options.model,
@@ -784,6 +905,9 @@ async function runTypeScriptEvolution(options: {
     examples: holdout,
     maxBytes,
     signal: options.signal,
+    useRealExecutor: true,
+    executorLogDir: path.join(runDir, "executor", "confirm"),
+    artifactName: slugify(bestCandidate.name) || "best-candidate",
   });
   bestCandidate.holdoutEvaluation = bestHoldoutEvaluation;
   bestCandidate.executionTraces.push(...bestHoldoutTraces);

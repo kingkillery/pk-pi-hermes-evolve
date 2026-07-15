@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Improvement-impact fixes for the evolution loop
+
+Five changes targeting measurement validity and compounding, so that reported "improvement" reflects real gains rather than evaluation artifacts:
+
+- ground baseline validation/holdout scoring (and the winner's holdout confirmation) in the real `pi` executor, matching the regime candidates are already measured under; previously the baseline was judge-predicted while candidates were executor-grounded, biasing every improvement delta
+- blind the judge to the artifact's prose whenever a real executor observation exists — the judge now scores what the agent actually did, not how persuasive the artifact text reads
+- stop leaking the validation split into reflection: accepted pool entries now carry their train-minibatch traces/evaluation for reflection-prompt assembly, so mutations are no longer steered by the same instances used for candidate selection (the selection metric itself still uses the full validation pass)
+- surface real executor stdout excerpts (up to 3 failing traces, 1200 chars each, flagged via the new `ExecutionTrace.hasRealExecution`) in the mutation reflection prompt, giving the mutator observed behavior instead of only judge summaries
+- difficulty-stratified `splitExamples` with size-first allocation for n≥5, so validation/holdout splits get representative difficulty mixes instead of positional slices; n≤4 behavior is unchanged
+- seed the Pareto pool with the best cross-run ancestor: new `resolveAncestorBody` in `src/lineage.ts` hash-verifies the ancestor run's persisted `best-candidate.md` against `lineage.jsonl` before the engine constraint-checks it, evaluates it on validation, and adds it as an `ancestor` pool entry — successive runs now compound instead of restarting from the raw artifact
+
 ### GEPA-Pareto review fixes
 
 Addresses CodeRabbit review findings on the GEPA-Pareto PR:

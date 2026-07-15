@@ -79,6 +79,13 @@ export interface ExecutionTrace {
   feedback: string;
   isFailure: boolean;
   timestamp: string;
+  /**
+   * True when `rawOutput` is a real `pi` executor stdout transcript (the artifact was actually
+   * run) rather than the judge's own JSON response. Reflection prompts use this to decide
+   * whether `rawOutput` is safe to show the mutator as "what the agent did" — judge JSON
+   * presented as observed behavior would mislead the mutation, not inform it.
+   */
+  hasRealExecution?: boolean;
 }
 
 export type ConstraintName =
