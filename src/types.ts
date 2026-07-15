@@ -79,6 +79,13 @@ export interface ExecutionTrace {
   feedback: string;
   isFailure: boolean;
   timestamp: string;
+  /**
+   * True when `rawOutput` is a real `pi` executor stdout transcript (the artifact was actually
+   * run) rather than the judge's own JSON response. Reflection prompts use this to decide
+   * whether `rawOutput` is safe to show the mutator as "what the agent did" — judge JSON
+   * presented as observed behavior would mislead the mutation, not inform it.
+   */
+  hasRealExecution?: boolean;
 }
 
 export type ConstraintName =
@@ -150,6 +157,16 @@ export interface CandidateRecord extends CandidateDraft {
    * degenerate "winner" promotion without spelunking `warnings`.
    */
   wasFallbackPromoted?: boolean;
+  /**
+   * Names of the pool member(s) this candidate was derived from: one entry for a mutation,
+   * two for a merge (in `a, b` order as passed to `generateMergeCandidateDraft`). Undefined
+   * for the baseline itself.
+   */
+  parentCandidates?: string[];
+  /** How this candidate's draft was produced: reflective mutation of a Pareto-selected parent, or a merge of two frontier candidates. */
+  selectionMethod?: "mutation" | "merge";
+  /** Composite judge score on the cheap train-set minibatch, used as the pre-filter gate before a full validation pass. */
+  minibatchScore?: number;
 }
 
 export interface EvolutionOptions {
@@ -217,6 +234,12 @@ export interface EvolutionRunResult {
   baselineTraces: ExecutionTrace[];
   prResult?: PRAutomationResult;
   iterations?: IterationRecord[];
+  /** Names of the final Pareto-frontier candidates (best-on-at-least-one-validation-instance), for reporting. */
+  paretoFrontier?: string[];
+  /** Number of system-aware merge candidates attempted during this run. */
+  mergeAttempts?: number;
+  /** Number of iterations rejected by the minibatch pre-filter before reaching a full validation pass. */
+  minibatchFilteredCount?: number;
 }
 
 export interface ReflectionPrompt {
@@ -228,7 +251,10 @@ export interface ReflectionPrompt {
 
 export interface IterationRecord {
   iteration: number;
+  /** Primary parent's pool name (the mutation parent, or the first merge input). Kept for backward compatibility; see `parentCandidates` for the full lineage. */
   parentCandidate?: string;
+  /** Full lineage: one entry for a mutation, two (`a`, `b`) for a merge. */
+  parentCandidates?: string[];
   mutationRationale: string;
   reflectionPrompt: ReflectionPrompt;
   candidate: CandidateDraft;
@@ -237,6 +263,18 @@ export interface IterationRecord {
   scoreDelta: number;
   accepted: boolean;
   gateResults?: TieredGateResult[];
+  /** How the draft evaluated in this iteration was produced. */
+  selectionMethod?: "mutation" | "merge";
+  /** Size of the Pareto frontier at selection time: the mutation-parent sampling pool for a mutation, or the frontier a merge's two inputs were drawn from. */
+  paretoFrontierSize?: number;
+  /**
+   * True when the candidate was rejected by the cheap minibatch pre-filter
+   * (composite on a small train subset did not beat its parent) and therefore
+   * never went through the expensive full-validation + real-executor pass.
+   * When true, `evaluation`/`traces` hold the minibatch-only results, not a
+   * validation-set evaluation.
+   */
+  minibatchFiltered?: boolean;
 }
 
 export interface ExecutionObservation {

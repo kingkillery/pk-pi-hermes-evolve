@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+### Improvement-impact fixes for the evolution loop
+
+Five changes targeting measurement validity and compounding, so that reported "improvement" reflects real gains rather than evaluation artifacts:
+
+- ground baseline validation/holdout scoring (and the winner's holdout confirmation) in the real `pi` executor, matching the regime candidates are already measured under; previously the baseline was judge-predicted while candidates were executor-grounded, biasing every improvement delta
+- blind the judge to the artifact's prose whenever a real executor observation exists — the judge now scores what the agent actually did, not how persuasive the artifact text reads
+- stop leaking the validation split into reflection: accepted pool entries now carry their train-minibatch traces/evaluation for reflection-prompt assembly, so mutations are no longer steered by the same instances used for candidate selection (the selection metric itself still uses the full validation pass)
+- surface real executor stdout excerpts (up to 3 failing traces, 1200 chars each, flagged via the new `ExecutionTrace.hasRealExecution`) in the mutation reflection prompt, giving the mutator observed behavior instead of only judge summaries
+- difficulty-stratified `splitExamples` with size-first allocation for n≥5, so validation/holdout splits get representative difficulty mixes instead of positional slices; n≤4 behavior is unchanged
+- seed the Pareto pool with the best cross-run ancestor: new `resolveAncestorBody` in `src/lineage.ts` hash-verifies the ancestor run's persisted `best-candidate.md` against `lineage.jsonl` before the engine constraint-checks it, evaluates it on validation, and adds it as an `ancestor` pool entry — successive runs now compound instead of restarting from the raw artifact
+
+### GEPA-Pareto review fixes
+
+Addresses CodeRabbit review findings on the GEPA-Pareto PR:
+
+- fix merge candidates being minibatch-filtered and score-deltaed against an unrelated sampled `parent` instead of their actual merge inputs `a`/`b`; the comparison baseline is now the stronger of the two merge parents
+- fail closed instead of silently skipping when the tiered gate itself throws (as opposed to a tier resolving `passed: false`, which `runTieredGate` already handles internally) — an exception now rejects the iteration rather than letting the candidate through unchecked
+- fix the no-fully-evaluated-candidate fallback promoting a draft under its parent's (or a partial minibatch) score; it now only promotes from iterations that completed a real full-validation pass on themselves, and retains the baseline (with baseline's own genuine evaluation) rather than misattributing a score when nothing did
+- `CandidateRecord`/`IterationRecord` gain `parentCandidates?: string[]` (replacing the synthetic `"a+b"` string lineage for merges) alongside the existing single-parent `IterationRecord.parentCandidate` for backward compatibility
+- `tests/parity.test.ts` now parses the README parity table's status/evidence columns per row instead of a whole-section substring check, and rejects duplicate capability rows
+
+### GEPA-Pareto upgrade to the reflective loop
+
+Aligns the iterative loop in `src/engine.ts` with GEPA ("Reflective Prompt Evolution Can Outperform Reinforcement Learning", arXiv:2507.19457) — the current state-of-the-art reflective/evolutionary prompt optimizer, which this package's `optimizerUsed` label already claimed lineage from without implementing the algorithm's core mechanisms.
+
+- fix a correctness bug where every mutation was generated from the pristine original artifact body regardless of `parentName`, so accepted gains from prior iterations were discarded rather than compounded; `generateOneCandidateDraft` now takes `parentBody` and mutates the actual selected parent
+- replace single-lineage greedy hill-climbing (`accepted = scoreDelta > priorComposite`, chaining from the single last-accepted candidate) with a Pareto-frontier candidate pool: `computeParetoFrontier` tracks per-validation-instance winners and prunes dominated candidates; `selectParetoParent` samples the next mutation parent proportional to frontier appearance, which avoids collapsing to a local optimum once the first easy gains are exhausted
+- add a cheap train-set minibatch pre-filter (`evaluateArtifact` on 1-2 examples) before paying for a full validation pass with the real `pi` executor; only a clear regression vs. the parent's minibatch score is rejected, matching GEPA's "35x fewer rollouts" efficiency lever
+- move the tiered regression gate (typecheck → cohort → coherence) to run immediately after constraint validation, before the minibatch filter and full judge pass, since it is a cheap, quality-orthogonal safety signal that should short-circuit expensive rollouts rather than run after them
+- add a bounded system-aware merge (`generateMergeCandidateDraft`, GEPA Appendix F "crossover"): every third iteration, if the pool has ≥2 distinct mutation lineages on the frontier, attempt synthesizing one candidate from two frontier candidates' complementary per-instance strengths; capped at 2 attempts per run
+- final `bestCandidate` selection now considers every fully-validated pool member (not just the accepted chain), matching GEPA's "return candidate with best aggregate performance on validation set" stopping rule
+- extend `types.ts` additively: `CandidateRecord.parentCandidate/selectionMethod/minibatchScore`, `IterationRecord.selectionMethod/paretoFrontierSize/minibatchFiltered`, `EvolutionRunResult.paretoFrontier/mergeAttempts/minibatchFilteredCount`
+- `optimizerUsed` renamed from `"gepa-iterative"` to `"gepa-pareto"`; `report.md` gains an "Optimization strategy" section and the candidates table gains Parent/Method columns
+- README parity table and `tests/parity.test.ts` gain rows for the Pareto-frontier pool and system-aware merge
+
 ### TypeScript-native Hermes Phase 1 parity
 
 The TypeScript engine is now the source-of-truth implementation of the Hermes Phase 1 workflow. Python/DSPy is an optional acceleration mode rather than the primary backend.

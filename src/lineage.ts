@@ -112,3 +112,23 @@ function pickHighestScore(entries: LineageEntry[]): LineageEntry {
   }
   return best;
 }
+
+const RUNS_REL_PATH = path.join(".pi", "hermes-self-evolution", "runs");
+
+/**
+ * Loads and hash-verifies the winning artifact body from an ancestor run's `best-candidate.md`
+ * (`runDir = .pi/hermes-self-evolution/runs/<entry.runId>`, written by the engine alongside the
+ * lineage entry). Returns null if the run directory or file is missing, or if the file's content
+ * hash no longer matches `entry.artifactHash` — a human edit, a pruned run, or a mismatched
+ * lineage.jsonl would otherwise let an unverified body silently become a mutation parent.
+ */
+export async function resolveAncestorBody(cwd: string, entry: LineageEntry): Promise<string | null> {
+  const candidatePath = path.join(cwd, RUNS_REL_PATH, entry.runId, "best-candidate.md");
+  let body: string;
+  try {
+    body = await fs.readFile(candidatePath, "utf8");
+  } catch {
+    return null;
+  }
+  return hashContent(body) === entry.artifactHash ? body : null;
+}
