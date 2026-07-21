@@ -6,10 +6,18 @@ export interface TieredGateOptions {
 	candidateText: string;
 	tsConfigPath?: string;
 	cohortExamples?: EvalExample[];
+	/**
+	 * Baseline composite on the SAME cohort as the candidate will be judged on, typically computed
+	 * once per run by the caller via `judgeFunc(baselineText, cohortExamples)` and cached. Must
+	 * never be a score from a different split (e.g. the sealed holdout) — the cohort tier is a
+	 * paired comparison and both sides have to be measured on identical examples.
+	 */
 	baselineScore?: number;
 	maxRegressionPct?: number;
-	judgeFunc?: (examples: EvalExample[]) => Promise<{ composite: number }>;
-	coherenceCheck?: () => Promise<{ passed: boolean; detail: string }>;
+	/** Judges an artifact text on a cohort. Called with the candidate text under evaluation. */
+	judgeFunc?: (artifactText: string, examples: EvalExample[]) => Promise<{ composite: number }>;
+	/** Coherence check for the candidate text under evaluation. */
+	coherenceCheck?: (candidateText: string) => Promise<{ passed: boolean; detail: string }>;
 	signal?: AbortSignal;
 }
 
@@ -60,8 +68,9 @@ async function runTypecheckTier(options: TieredGateOptions): Promise<TieredGateR
 			resolve({
 				tier: "typecheck",
 				passed: false,
-				reasonCode: "typecheck_failed",
-				detail: truncateTail(err.message, 500),
+				status: "unknown",
+				reasonCode: "typecheck_error",
+				detail: truncateTail(`typecheck could not run: ${err.message}`, 500),
 				durationMs: Date.now() - start,
 			});
 		});
@@ -72,7 +81,8 @@ async function runTypecheckTier(options: TieredGateOptions): Promise<TieredGateR
 				resolve({
 					tier: "typecheck",
 					passed: false,
-					reasonCode: "typecheck_failed",
+					status: "unknown",
+					reasonCode: "typecheck_aborted",
 					detail: "aborted",
 					durationMs,
 				});
@@ -82,6 +92,7 @@ async function runTypecheckTier(options: TieredGateOptions): Promise<TieredGateR
 				resolve({
 					tier: "typecheck",
 					passed: true,
+					status: "pass",
 					reasonCode: "ok",
 					detail: "typecheck clean",
 					durationMs,
@@ -92,6 +103,7 @@ async function runTypecheckTier(options: TieredGateOptions): Promise<TieredGateR
 			resolve({
 				tier: "typecheck",
 				passed: false,
+				status: "fail",
 				reasonCode: "typecheck_failed",
 				detail: truncateTail(combined || `exit code ${code ?? -1}`, 500),
 				durationMs,
@@ -104,24 +116,40 @@ async function runTypecheckTier(options: TieredGateOptions): Promise<TieredGateR
 async function runCohortTier(options: TieredGateOptions): Promise<TieredGateResult> {
 	const start = Date.now();
 	const examples = options.cohortExamples;
-	if (!examples || examples.length === 0 || !options.judgeFunc || options.baselineScore === undefined) {
+	if (!examples || examples.length === 0 || !options.judgeFunc) {
 		return {
 			tier: "cohort",
 			passed: true,
+			status: "pass",
 			reasonCode: "skipped_no_cohort",
 			detail: "no cohort configured",
 			durationMs: Date.now() - start,
 		};
 	}
+	// A cohort is configured but the paired same-cohort baseline is unavailable (e.g. the
+	// caller's baseline judging errored). Fail closed: there is nothing valid to compare the
+	// candidate against, and falling back to a score from another split would not be a paired
+	// measurement.
+	if (options.baselineScore === undefined) {
+		return {
+			tier: "cohort",
+			passed: false,
+			status: "unknown",
+			reasonCode: "cohort_baseline_unavailable",
+			detail: "cohort configured but no same-cohort baseline score was provided; failing closed",
+			durationMs: Date.now() - start,
+		};
+	}
 	const threshold = options.maxRegressionPct ?? 0.02;
 	try {
-		const result = await options.judgeFunc(examples);
+		const result = await options.judgeFunc(options.candidateText, examples);
 		const delta = result.composite - options.baselineScore;
 		const durationMs = Date.now() - start;
 		if (delta < -threshold) {
 			return {
 				tier: "cohort",
 				passed: false,
+				status: "fail",
 				reasonCode: "cohort_regression",
 				detail: `delta=${delta.toFixed(4)}, threshold=${(-threshold).toFixed(4)}`,
 				durationMs,
@@ -130,15 +158,19 @@ async function runCohortTier(options: TieredGateOptions): Promise<TieredGateResu
 		return {
 			tier: "cohort",
 			passed: true,
+			status: "pass",
 			reasonCode: "ok",
 			detail: `delta=${delta.toFixed(4)}`,
 			durationMs,
 		};
 	} catch (err) {
+		// Judge outage is not a regression verdict — mark it unknown (still blocking) rather than
+		// mislabeling it as a measured cohort_regression.
 		return {
 			tier: "cohort",
 			passed: false,
-			reasonCode: "cohort_regression",
+			status: "unknown",
+			reasonCode: "cohort_judge_error",
 			detail: truncateTail(`judge error: ${err instanceof Error ? err.message : String(err)}`, 500),
 			durationMs: Date.now() - start,
 		};
@@ -151,18 +183,20 @@ async function runCoherenceTier(options: TieredGateOptions): Promise<TieredGateR
 		return {
 			tier: "coherence",
 			passed: true,
+			status: "pass",
 			reasonCode: "skipped_no_check",
 			detail: "no coherence check configured",
 			durationMs: Date.now() - start,
 		};
 	}
 	try {
-		const result = await options.coherenceCheck();
+		const result = await options.coherenceCheck(options.candidateText);
 		const durationMs = Date.now() - start;
 		if (!result.passed) {
 			return {
 				tier: "coherence",
 				passed: false,
+				status: "fail",
 				reasonCode: "coherence_failed",
 				detail: result.detail,
 				durationMs,
@@ -171,6 +205,7 @@ async function runCoherenceTier(options: TieredGateOptions): Promise<TieredGateR
 		return {
 			tier: "coherence",
 			passed: true,
+			status: "pass",
 			reasonCode: "ok",
 			detail: result.detail,
 			durationMs,
@@ -179,7 +214,8 @@ async function runCoherenceTier(options: TieredGateOptions): Promise<TieredGateR
 		return {
 			tier: "coherence",
 			passed: false,
-			reasonCode: "coherence_failed",
+			status: "unknown",
+			reasonCode: "coherence_error",
 			detail: truncateTail(`coherence error: ${err instanceof Error ? err.message : String(err)}`, 500),
 			durationMs: Date.now() - start,
 		};
