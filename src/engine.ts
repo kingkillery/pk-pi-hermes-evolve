@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { withFileMutationQueue } from "@mariozechner/pi-coding-agent";
 import { detectPythonBackend, runPythonBackend } from "./python-backend.js";
@@ -77,29 +78,57 @@ const SECRET_PATTERNS: Array<{ name: string; pattern: RegExp }> = [
 
 export function scanForSecrets(text: string): SecretScanResult {
   const found: SecretScanResult["patterns"] = [];
+  const spans: SecretScanResult["spans"] = [];
   for (const { name, pattern } of SECRET_PATTERNS) {
-    const match = text.match(pattern);
-    if (match && match[0]) {
-      const index = match.index ?? 0;
-      const location = index < 200 ? text.slice(0, Math.min(80, text.length)) : `offset ${index}`;
-      found.push({ pattern: name, match: match[0].slice(0, 20) + "…", location });
+    // Clone with the global flag so EVERY occurrence is captured, not just the first.
+    const global = new RegExp(pattern.source, pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`);
+    for (const match of text.matchAll(global)) {
+      if (!match[0]) continue;
+      const start = match.index ?? 0;
+      const end = start + match[0].length;
+      spans.push({ start, end, ruleId: name });
+      // Findings carry only the rule id and span — never a preview of the matched text, which
+      // would leak (a prefix of) the secret into logs, reports, and exceptions.
+      found.push({ pattern: name, match: `[${name} redacted]`, location: `offset ${start}..${end}` });
     }
   }
-  return { found: found.length > 0, patterns: found };
+  return { found: found.length > 0, patterns: found, spans };
+}
+
+/**
+ * Removes every scanned secret span from `text` by exact character offsets, replacing back to
+ * front so earlier spans stay valid while later ones are rewritten. String-replacing a match
+ * preview (the previous approach) silently left the real secret in place whenever the preview
+ * was truncated or occurred more than once.
+ */
+export function redactSecrets(text: string): { text: string; redactedCount: number } {
+  const { spans } = scanForSecrets(text);
+  if (spans.length === 0) return { text, redactedCount: 0 };
+  // Merge overlapping spans (different rules can match overlapping regions) into disjoint
+  // intervals so partial overlaps can't leave a sliver of a secret behind.
+  const ordered = [...spans].sort((a, b) => a.start - b.start || a.end - b.end);
+  const merged: Array<{ start: number; end: number }> = [];
+  for (const span of ordered) {
+    const last = merged[merged.length - 1];
+    if (last && span.start <= last.end) last.end = Math.max(last.end, span.end);
+    else merged.push({ start: span.start, end: span.end });
+  }
+  let result = text;
+  for (let i = merged.length - 1; i >= 0; i -= 1) {
+    const { start, end } = merged[i]!;
+    result = `${result.slice(0, start)}[REDACTED]${result.slice(end)}`;
+  }
+  return { text: result, redactedCount: merged.length };
 }
 
 function stripSecretsFromExamples(examples: EvalExample[]): { clean: EvalExample[]; stripped: number } {
   let stripped = 0;
   const clean = examples.map((ex) => {
-    const taskScan = scanForSecrets(ex.taskInput);
-    const behaviorScan = scanForSecrets(ex.expectedBehavior);
-    if (taskScan.found || behaviorScan.found) {
+    const task = redactSecrets(ex.taskInput);
+    const behavior = redactSecrets(ex.expectedBehavior);
+    if (task.redactedCount > 0 || behavior.redactedCount > 0) {
       stripped += 1;
-      let taskInput = ex.taskInput;
-      let expectedBehavior = ex.expectedBehavior;
-      for (const p of taskScan.patterns) taskInput = taskInput.replace(p.match, "[REDACTED]");
-      for (const p of behaviorScan.patterns) expectedBehavior = expectedBehavior.replace(p.match, "[REDACTED]");
-      return { ...ex, taskInput, expectedBehavior };
+      return { ...ex, taskInput: task.text, expectedBehavior: behavior.text };
     }
     return ex;
   });
@@ -260,28 +289,83 @@ async function runTestCommand(testCommand: string, cwd: string, timeoutMs: numbe
   });
 }
 
-async function computeSemanticDrift(cwd: string, originalBody: string, evolvedBody: string, objective: string, model?: string, thinkingLevel?: string, signal?: AbortSignal): Promise<{ score: number; feedback: string }> {
+async function computeSemanticDrift(cwd: string, originalBody: string, evolvedBody: string, objective: string, model?: string, thinkingLevel?: string, signal?: AbortSignal): Promise<{ status: "ok" | "unknown"; score?: number; feedback: string }> {
   const prompt = [`Original body (first 3000 chars):`, "```", originalBody.slice(0, 3000), "```", "", `Evolved body (first 3000 chars):`, "```", evolvedBody.slice(0, 3000), "```", "", `Objective: ${objective}`, "", "Score SEMANTIC DRIFT: 0.0 = identical meaning, 1.0 = different purpose.", 'Return JSON: {"driftScore": 0.0, "feedback": "explanation"}'].join("\n");
-  try { const raw = await runPiTextTask({ cwd, model, thinkingLevel, systemPrompt: DRIFT_SYSTEM_PROMPT, prompt, signal }); const p = extractJsonPayload(raw) as { driftScore?: unknown; feedback?: unknown }; return { score: clampScore(p.driftScore), feedback: String(p.feedback ?? "").trim() }; } catch { return { score: 0.2, feedback: "Drift detection failed." }; }
+  // Fail closed: a drift-judge outage must never turn into a plausible passing score (the old
+  // behavior returned a fabricated 0.2, which sailed under the 0.4 threshold). Retry once, then
+  // report "unknown" so the caller blocks the candidate instead of scoring it.
+  let lastError = "";
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    if (signal?.aborted) break;
+    try {
+      const raw = await runPiTextTask({ cwd, model, thinkingLevel, systemPrompt: DRIFT_SYSTEM_PROMPT, prompt, signal });
+      const p = extractJsonPayload(raw) as { driftScore?: unknown; feedback?: unknown };
+      return { status: "ok", score: clampScore(p.driftScore), feedback: String(p.feedback ?? "").trim() };
+    } catch (err) {
+      lastError = err instanceof Error ? err.message : String(err);
+    }
+  }
+  return { status: "unknown", feedback: `Drift check unavailable after retry: ${lastError}` };
 }
 
+async function runCommand(command: string, args: string[], cwd: string): Promise<{ stdout: string; code: number }> {
+  return await new Promise((resolve) => {
+    const child = spawn(command, args, { cwd, stdio: ["pipe", "pipe", "pipe"] });
+    let stdout = ""; let stderr = "";
+    child.stdout.on("data", (c: Buffer) => { stdout += String(c); });
+    child.stderr.on("data", (c: Buffer) => { stderr += String(c); });
+    child.on("error", () => resolve({ stdout: stderr.trim(), code: 127 }));
+    child.on("close", (code) => resolve({ stdout: (stdout || stderr).trim(), code: code ?? 1 }));
+    child.stdin.end();
+  });
+}
+
+/**
+ * Commits the winning candidate on a new branch inside a DISPOSABLE git worktree and opens a PR
+ * via the GitHub CLI. The caller's active checkout is never touched: no branch switch, no write
+ * to the target file in the working tree, and the worktree is removed in a `finally`. `git` and
+ * `gh` are separate binaries invoked separately — the previous implementation ran `git pr create`,
+ * which is not a git subcommand and therefore never created a PR.
+ */
 async function createGitBranchWithCandidate(target: ArtifactTarget, bestCandidate: CandidateRecord, improvement: number, runDir: string, reportPath: string, objective: string, modelLabel: string, baselineTraces: ExecutionTrace[], candidates: CandidateRecord[], cwd: string): Promise<PRAutomationResult | undefined> {
   const branch = `evolve/${slugify(target.name)}-${formatTimestamp()}`;
+  const git = (...args: string[]) => runCommand("git", args, cwd);
+  const relTarget = path.relative(cwd, target.path);
+  if (relTarget.startsWith("..") || path.isAbsolute(relTarget)) return undefined; // target outside the repo — nothing to branch
+  let worktreePath: string | undefined;
   try {
-    await fs.writeFile(target.path, bestCandidate.candidateFullText, "utf8");
-    const git = async (...args: string[]): Promise<{ stdout: string; code: number }> => new Promise((resolve) => { const child = spawn("git", args, { cwd, stdio: ["pipe", "pipe", "pipe"] }); let stdout = ""; let stderr = ""; child.stdout.on("data", (c: Buffer) => { stdout += String(c); }); child.stderr.on("data", (c: Buffer) => { stderr += String(c); }); child.on("close", (code) => resolve({ stdout: (stdout || stderr).trim(), code: code ?? 1 })); });
-    await git("checkout", "-b", branch); await git("add", target.path);
+    worktreePath = await fs.mkdtemp(path.join(os.tmpdir(), "hermes-evolve-wt-"));
+    const added = await git("worktree", "add", worktreePath, "-b", branch);
+    if (added.code !== 0) return undefined;
+    const gitWt = (...args: string[]) => runCommand("git", ["-C", worktreePath!, ...args], cwd);
+    await fs.mkdir(path.dirname(path.join(worktreePath, relTarget)), { recursive: true });
+    await fs.writeFile(path.join(worktreePath, relTarget), bestCandidate.candidateFullText, "utf8");
+    await gitWt("add", relTarget);
     const sign = improvement >= 0 ? "+" : "";
     const msg = `evolve: ${target.name} — ${sign}${improvement.toFixed(3)}\n\nObjective: ${objective}\nModel: ${modelLabel}\nTraces: ${baselineTraces.length}`;
-    await git("commit", "-m", msg);
-    let commitSha = ""; const sha = await git("rev-parse", "HEAD"); if (sha.code === 0) commitSha = sha.stdout.trim();
+    const committed = await gitWt("commit", "-m", msg);
+    if (committed.code !== 0) return undefined;
+    let commitSha = ""; const sha = await gitWt("rev-parse", "HEAD"); if (sha.code === 0) commitSha = sha.stdout.trim();
     let prUrl: string | undefined; let prNumber: number | undefined;
-    const push = await git("push", "-u", "origin", branch);
-    if (push.code === 0) { try { const pr = await git("pr", "create", "--title", `evolve: ${target.name}`, "--body", `Report: ${reportPath}`); if (pr.code === 0) { prUrl = pr.stdout.match(/https:\/\/\S+/)?.[0]; const nm = pr.stdout.match(/#(\d+)/); if (nm) prNumber = parseInt(nm[1], 10); } } catch { /* gh unavailable */ } }
-    const diff = await git("diff", "--stat", "HEAD~1"); const diffStat = diff.stdout.trim() || "no stat";
-    await git("checkout", "-");
+    const push = await gitWt("push", "-u", "origin", branch);
+    if (push.code === 0) {
+      const pr = await runCommand("gh", ["pr", "create", "--head", branch, "--title", `evolve: ${target.name}`, "--body", `Report: ${reportPath}`], worktreePath);
+      if (pr.code === 0) {
+        prUrl = pr.stdout.match(/https:\/\/\S+/)?.[0];
+        const nm = pr.stdout.match(/#(\d+)/); if (nm) prNumber = parseInt(nm[1], 10);
+      }
+    }
+    const diff = await gitWt("diff", "--stat", "HEAD~1", "HEAD");
+    const diffStat = diff.code === 0 && diff.stdout.trim() ? diff.stdout.trim() : "no stat";
     return { branch, commitSha, prUrl, prNumber, diffStat };
-  } catch { try { spawn("git", ["checkout", "-"], { cwd, stdio: "pipe" }); await fs.writeFile(target.path, target.fullText, "utf8"); } catch { /* best effort */ } return undefined; }
+  } catch {
+    return undefined;
+  } finally {
+    if (worktreePath) {
+      await git("worktree", "remove", "--force", worktreePath);
+      await fs.rm(worktreePath, { recursive: true, force: true }).catch(() => { /* already gone */ });
+    }
+  }
 }
 
 function normalizeExamples(payload: unknown, evalSource: EvalSource): EvalExample[] {
@@ -380,16 +464,34 @@ function buildTrace(artifactText: string, example: EvalExample, judged: JudgeRes
 
 async function evaluateArtifact(options: { cwd: string; model?: string; thinkingLevel?: string; target: ArtifactTarget; artifactText: string; objective: string; examples: EvalExample[]; maxBytes: number; signal?: AbortSignal; onProgress?: (detail: string) => void; useRealExecutor?: boolean; executorLogDir?: string; artifactName?: string }): Promise<{ evaluation: ArtifactEvaluation; traces: ExecutionTrace[]; executorObservations?: ExecutionObservation[] }> {
   const evals: ExampleEvaluation[] = []; const traces: ExecutionTrace[] = []; const observations: ExecutionObservation[] = [];
+  let executorFailureCount = 0;
   for (let i = 0; i < options.examples.length; i += 1) {
     const ex = options.examples[i]!; options.onProgress?.(`Judging ${i + 1}/${options.examples.length}`);
     let executorContext = ""; let observation: ExecutionObservation | undefined;
     if (options.useRealExecutor) {
-      try {
-        observation = await executeCandidateInPi({ cwd: options.cwd, candidateFullText: options.artifactText, taskInput: ex.taskInput, artifactName: options.artifactName || slugify(options.target.name) || "candidate", model: options.model, thinkingLevel: options.thinkingLevel, signal: options.signal });
+      // One retry on executor failure (spawn error or non-zero exit); if it still fails, count
+      // the failure so the caller can fail closed. A judge-estimated score is never silently
+      // substituted for an executor-grounded one — an evaluation with executorFailureCount > 0
+      // is not comparable to a clean one and must not accept or promote a candidate.
+      let lastError = "";
+      for (let attempt = 0; attempt < 2 && !options.signal?.aborted; attempt += 1) {
+        try {
+          observation = await executeCandidateInPi({ cwd: options.cwd, candidateFullText: options.artifactText, taskInput: ex.taskInput, artifactName: options.artifactName || slugify(options.target.name) || "candidate", model: options.model, thinkingLevel: options.thinkingLevel, signal: options.signal });
+          if (observation.exitCode === 0) break;
+          lastError = `executor exit ${observation.exitCode}: ${observation.stderr.slice(0, 300)}`;
+        } catch (err) {
+          observation = undefined;
+          lastError = err instanceof Error ? err.message : String(err);
+        }
+      }
+      if (observation) {
         observations.push(observation);
         executorContext = ["", "Observed agent stdout (actual pi run):", "```", observation.stdout.slice(0, 4000), "```", `Exit code: ${observation.exitCode}; duration: ${observation.durationMs}ms.`].join("\n");
         if (options.executorLogDir) { const dir = path.join(options.executorLogDir, String(i)); await safeWriteFile(path.join(dir, "stdout.log"), observation.stdout); await safeWriteFile(path.join(dir, "stderr.log"), observation.stderr); await safeWriteFile(path.join(dir, "meta.json"), JSON.stringify({ exitCode: observation.exitCode, durationMs: observation.durationMs, taskInput: ex.taskInput }, null, 2)); }
-      } catch (err) { executorContext = `\nExecutor unavailable: ${err instanceof Error ? err.message : String(err)}`; }
+      } else {
+        executorContext = `\nExecutor unavailable after retry: ${lastError}`;
+      }
+      if (!observation || observation.exitCode !== 0) executorFailureCount += 1;
     }
     // Blind the judge to the artifact's prose whenever we have a real observed transcript: score
     // what the agent actually did, not how well the instructions read. Without a real observation
@@ -408,7 +510,7 @@ async function evaluateArtifact(options: { cwd: string; model?: string; thinking
   const n = Math.max(1, evals.length);
   const raw: AggregateScore = { correctness: evals.reduce((s, e) => s + e.correctness, 0) / n, procedureFollowing: evals.reduce((s, e) => s + e.procedureFollowing, 0) / n, conciseness: evals.reduce((s, e) => s + e.conciseness, 0) / n, confidence: evals.reduce((s, e) => s + e.confidence, 0) / n, lengthPenalty: 0, composite: evals.reduce((s, e) => s + e.composite, 0) / n };
   const sr = Buffer.byteLength(options.artifactText, "utf8") / Math.max(1, options.maxBytes); const lp = sr > 0.9 ? Math.min(0.3, (sr - 0.9) * 3) : 0;
-  return { evaluation: { aggregate: { ...raw, lengthPenalty: lp, composite: Math.max(0, raw.composite - lp) }, examples: evals }, traces, executorObservations: observations.length > 0 ? observations : undefined };
+  return { evaluation: { aggregate: { ...raw, lengthPenalty: lp, composite: Math.max(0, raw.composite - lp) }, examples: evals, executorFailureCount: options.useRealExecutor ? executorFailureCount : undefined }, traces, executorObservations: observations.length > 0 ? observations : undefined };
 }
 
 async function generateDataset(options: { cwd: string; model?: string; thinkingLevel?: string; target: ArtifactTarget; objective: string; evalSource: EvalSource; maxExamples: number; sessionQuery?: string; signal?: AbortSignal; onProgress?: (detail: string) => void }): Promise<{ examples: EvalExample[]; sessionSnippets: ReturnType<typeof mineSessionSnippets> }> {
@@ -569,7 +671,7 @@ function buildReportMarkdown(result: EvolutionRunResult): string {
     `- **Baseline validation:** ${baselineValidation.toFixed(3)}`, `- **Best validation:** ${bestValidation.toFixed(3)}`,
     `- **Baseline holdout:** ${baselineHoldout.toFixed(3)}`, `- **Confirmed holdout:** ${bestHoldout.toFixed(3)}`, `- **Improvement:** ${result.improvement >= 0 ? "+" : ""}${result.improvement.toFixed(3)}`,
     `- **Traces:** ${totalTraces} captured, ${failures.length} failures`, "",
-    "## Guardrails", "- Original preserved, never auto-overwritten.", "- Frontmatter preserved verbatim.", "- Placeholders required to survive.", "- Size budget enforced.", "- Growth limited to 20%.", "- Semantic drift checked (threshold 0.4).", "- Secret scanning on datasets.", "",
+    "## Guardrails", "- Original preserved, never auto-overwritten.", "- Frontmatter preserved verbatim.", "- Placeholders required to survive.", "- Size budget enforced.", "- Growth limited to 20%.", "- Semantic drift checked (threshold 0.4, fail-closed when unmeasurable).", "- Secret scanning on datasets (span-based redaction).", "- Hard gates have no recovery path: a gate-failing candidate is never promoted; the fallback outcome is the baseline itself.", "",
     "## Optimization strategy (GEPA-Pareto)",
     "- Parent selection: Pareto-frontier sampling over per-instance validation scores (arXiv:2507.19457), not a single greedy best-so-far chain.",
     "- Mutation edits the selected parent's own body, so accepted gains compound instead of being re-derived from the original each iteration.",
@@ -603,8 +705,8 @@ async function runTypeScriptEvolution(options: {
   candidateCount: number; maxExamples: number; sessionQuery?: string; goldenTaskId?: string;
   testCommand?: string; testTimeout?: number; createPR?: boolean; persistGolden?: boolean;
   seed?: number; cohortExamples?: EvalExample[];
-  cohortJudgeFunc?: (examples: EvalExample[]) => Promise<{ composite: number }>;
-  coherenceCheck?: () => Promise<{ passed: boolean; detail: string }>;
+  cohortJudgeFunc?: (artifactText: string, examples: EvalExample[]) => Promise<{ composite: number }>;
+  coherenceCheck?: (candidateText: string) => Promise<{ passed: boolean; detail: string }>;
   tsConfigPath?: string;
   signal?: AbortSignal; onProgress?: (phase: string, detail?: string) => void;
 }): Promise<EvolutionRunResult> {
@@ -638,9 +740,13 @@ async function runTypeScriptEvolution(options: {
   // comparison, so the regime doesn't need to match.
   const baselineArtifactName = slugify(target.name) || "baseline";
   options.onProgress?.("baseline", "Train"); const { evaluation: baselineTrain, traces: btt } = await evaluateArtifact({ cwd: options.cwd, model: options.model, thinkingLevel: options.thinkingLevel, target, artifactText: target.fullText, objective: options.objective, examples: train, maxBytes, signal: options.signal, onProgress: (d) => options.onProgress?.("baseline", d) });
-  options.onProgress?.("baseline", "Holdout"); const { evaluation: baselineHoldout } = await evaluateArtifact({ cwd: options.cwd, model: options.model, thinkingLevel: options.thinkingLevel, target, artifactText: target.fullText, objective: options.objective, examples: holdout, maxBytes, signal: options.signal, useRealExecutor: true, executorLogDir: path.join(runDir, "executor", "baseline-holdout"), artifactName: baselineArtifactName });
-  options.onProgress?.("baseline", "Validation"); const { evaluation: baselineValidation } = await evaluateArtifact({ cwd: options.cwd, model: options.model, thinkingLevel: options.thinkingLevel, target, artifactText: target.fullText, objective: options.objective, examples: validation, maxBytes, signal: options.signal, useRealExecutor: true, executorLogDir: path.join(runDir, "executor", "baseline-validation"), artifactName: baselineArtifactName });
-  const baselineTraces = [...btt];
+  options.onProgress?.("baseline", "Holdout"); const { evaluation: baselineHoldout, traces: bht } = await evaluateArtifact({ cwd: options.cwd, model: options.model, thinkingLevel: options.thinkingLevel, target, artifactText: target.fullText, objective: options.objective, examples: holdout, maxBytes, signal: options.signal, useRealExecutor: true, executorLogDir: path.join(runDir, "executor", "baseline-holdout"), artifactName: baselineArtifactName });
+  options.onProgress?.("baseline", "Validation"); const { evaluation: baselineValidation, traces: bvt } = await evaluateArtifact({ cwd: options.cwd, model: options.model, thinkingLevel: options.thinkingLevel, target, artifactText: target.fullText, objective: options.objective, examples: validation, maxBytes, signal: options.signal, useRealExecutor: true, executorLogDir: path.join(runDir, "executor", "baseline-validation"), artifactName: baselineArtifactName });
+  // Keep the executor-grounded baseline traces too (not just the judge-only train ones): they
+  // are the real-behavior record for the retained-baseline outcome and for trace reporting.
+  // They feed reporting only — reflection pulls from pool-entry minibatch traces, so the
+  // validation/holdout splits still never reach the proposer.
+  const baselineTraces = [...btt, ...bht, ...bvt];
 
   // Lineage: try to find best ancestor for this artifact path, and — if its winning body is
   // still hash-verifiable and would still pass the CURRENT baseline's constraints — resolve it
@@ -682,23 +788,30 @@ async function runTypeScriptEvolution(options: {
   const iterations: IterationRecord[] = []; const candidates: CandidateRecord[] = [];
   const paretoRng = options.seed !== undefined ? mulberry32(options.seed ^ 0x9e3779b9) : Math.random;
   const minibatch = train.slice(0, Math.max(1, Math.min(2, train.length)));
+  // The reflection minibatch (a train subset) is EXECUTOR-GROUNDED for every pool entry,
+  // baseline included: pool-entry traces are what reflection prompts show the mutator, so they
+  // must be real pi execution transcripts, not judge speculation — and the minibatch pre-filter
+  // compares parent vs. child minibatch scores, so both sides must be measured under the same
+  // regime. Train examples are used, keeping validation/holdout hidden from the proposer.
+  options.onProgress?.("baseline", "Reflection minibatch");
+  const { evaluation: baselineMinibatch, traces: baselineMinibatchTraces } = await evaluateArtifact({ cwd: options.cwd, model: options.model, thinkingLevel: options.thinkingLevel, target, artifactText: target.fullText, objective: options.objective, examples: minibatch, maxBytes, signal: options.signal, useRealExecutor: true, executorLogDir: path.join(runDir, "executor", "baseline-minibatch"), artifactName: baselineArtifactName });
   const pool: ParetoPoolEntry[] = [{
     name: "baseline",
     body: target.body,
     fullText: target.fullText,
     validationScores: baselineValidation.examples.map((e) => e.composite),
-    minibatchScore: mean(baselineTrain.examples.slice(0, minibatch.length).map((e) => e.composite)),
-    traces: baselineTraces,
-    evaluation: baselineTrain,
+    minibatchScore: baselineMinibatch.aggregate.composite,
+    traces: baselineMinibatchTraces,
+    evaluation: baselineMinibatch,
   }];
   if (ancestorSeed) {
     // Same evaluation regime as every other pool entry: executor-grounded validation score for
-    // Pareto bookkeeping, minibatch score/traces (judge-only, matching the mutation-parent
+    // Pareto bookkeeping, executor-grounded minibatch score/traces (matching the mutation-parent
     // filter reference and reflection source) for everything else.
     options.onProgress?.("lineage", "Evaluating ancestor seed on validation");
     const ancestorArtifactName = slugify(`ancestor-${ancestorSeed.entry.runId}`) || "ancestor";
     const { evaluation: ancestorValidation } = await evaluateArtifact({ cwd: options.cwd, model: options.model, thinkingLevel: options.thinkingLevel, target, artifactText: ancestorSeed.fullText, objective: options.objective, examples: validation, maxBytes, signal: options.signal, useRealExecutor: true, executorLogDir: path.join(runDir, "executor", "ancestor-seed"), artifactName: ancestorArtifactName });
-    const { evaluation: ancestorMinibatch, traces: ancestorMinibatchTraces } = await evaluateArtifact({ cwd: options.cwd, model: options.model, thinkingLevel: options.thinkingLevel, target, artifactText: ancestorSeed.fullText, objective: options.objective, examples: minibatch, maxBytes, signal: options.signal });
+    const { evaluation: ancestorMinibatch, traces: ancestorMinibatchTraces } = await evaluateArtifact({ cwd: options.cwd, model: options.model, thinkingLevel: options.thinkingLevel, target, artifactText: ancestorSeed.fullText, objective: options.objective, examples: minibatch, maxBytes, signal: options.signal, useRealExecutor: true, executorLogDir: path.join(runDir, "executor", "ancestor-minibatch"), artifactName: ancestorArtifactName });
     pool.push({
       name: "ancestor",
       body: ancestorSeed.body,
@@ -709,6 +822,21 @@ async function runTypeScriptEvolution(options: {
       evaluation: ancestorMinibatch,
     });
   }
+  // Same-cohort paired baseline for the tiered gate's cohort tier, computed ONCE per run by
+  // judging the baseline artifact on the exact cohort candidates will be judged on. The previous
+  // code compared the candidate's cohort score against the sealed holdout baseline aggregate —
+  // a different example set (an invalid unpaired comparison) that also leaked the holdout
+  // baseline into the search loop. If baseline judging fails even after a retry, the score stays
+  // undefined and the cohort tier fails closed for every candidate.
+  let cohortBaselineScore: number | undefined;
+  if (options.cohortExamples && options.cohortExamples.length > 0 && options.cohortJudgeFunc) {
+    for (let attempt = 0; attempt < 2 && cohortBaselineScore === undefined; attempt += 1) {
+      try { cohortBaselineScore = (await options.cohortJudgeFunc(target.fullText, options.cohortExamples)).composite; }
+      catch (err) { options.onProgress?.("gate", `cohort baseline judge attempt ${attempt + 1} failed: ${err instanceof Error ? err.message : String(err)}`); }
+    }
+    if (cohortBaselineScore === undefined) options.onProgress?.("gate", "cohort baseline unavailable; cohort tier will fail closed");
+  }
+
   const MERGE_EVERY = 3; const MAX_MERGE_ATTEMPTS = 2; let mergeAttempts = 0; let minibatchFilteredCount = 0;
   for (let iter = 1; iter <= iterationCount; iter += 1) {
     const { parent, frontierSize } = selectParetoParent(pool, paretoRng);
@@ -772,7 +900,7 @@ async function runTypeScriptEvolution(options: {
         judgeFunc: options.cohortJudgeFunc,
         coherenceCheck: options.coherenceCheck,
         tsConfigPath: options.tsConfigPath,
-        baselineScore: baselineHoldout.aggregate.composite,
+        baselineScore: cohortBaselineScore,
       });
     } catch (err) { gateError = err instanceof Error ? err.message : String(err); }
     if (gateError !== undefined) {
@@ -791,14 +919,25 @@ async function runTypeScriptEvolution(options: {
       continue;
     }
 
-    // Minibatch pre-filter: judge on a cheap 1-2 example train subset before paying for a full
-    // validation pass with the real pi executor. Only reject a CLEAR regression vs. the comparison
-    // baseline on the same subset — ties proceed, since a 1-2 example judge score is noisy and a
-    // tie carries no real signal to reject on. This is GEPA's main lever for the "35x fewer
-    // rollouts" result. The comparison baseline is the sampled parent for a mutation, or the
-    // stronger of the two merge inputs for a merge (see comparisonMinibatchScore above).
+    // Minibatch pre-filter: an executor-grounded 1-2 example train subset before paying for a
+    // full validation pass. Only reject a CLEAR regression vs. the comparison baseline on the
+    // same subset — ties proceed, since a 1-2 example score is noisy and a tie carries no real
+    // signal to reject on. This is GEPA's main lever for the "35x fewer rollouts" result. The
+    // comparison baseline is the sampled parent for a mutation, or the stronger of the two merge
+    // inputs for a merge (see comparisonMinibatchScore above). Real execution here also gives the
+    // pool entry genuine transcripts for descendant reflection prompts.
     options.onProgress?.("iteration", `${iter} minibatch pre-filter`);
-    const { evaluation: minibatchEval, traces: minibatchTraces } = await evaluateArtifact({ cwd: options.cwd, model: options.model, thinkingLevel: options.thinkingLevel, target, artifactText: fullText, objective: options.objective, examples: minibatch, maxBytes, signal: options.signal });
+    const { evaluation: minibatchEval, traces: minibatchTraces } = await evaluateArtifact({ cwd: options.cwd, model: options.model, thinkingLevel: options.thinkingLevel, target, artifactText: fullText, objective: options.objective, examples: minibatch, maxBytes, signal: options.signal, useRealExecutor: true, executorLogDir: path.join(runDir, "executor", `minibatch-${iter}`), artifactName: draft.name });
+    if ((minibatchEval.executorFailureCount ?? 0) > 0) {
+      // Fail closed: an executor failure means this minibatch score is not comparable to the
+      // parent's executor-grounded one — do not filter on it, and do not proceed to validation
+      // under a mixed-regime measurement.
+      const iterRecord: IterationRecord = { iteration: iter, parentCandidate: parentNames[0], parentCandidates: parentNames, mutationRationale: draft.rationale, reflectionPrompt: recordedReflection, candidate: { name: draft.name, rationale: draft.rationale, candidateBody: draft.candidateBody }, evaluation: minibatchEval, traces: minibatchTraces, scoreDelta: 0, accepted: false, selectionMethod, paretoFrontierSize: reportedFrontierSize, minibatchFiltered: true, gateResults };
+      iterations.push(iterRecord);
+      await safeWriteFile(path.join(runDir, "iterations", `${iter}.json`), JSON.stringify({ ...iterRecord, candidateFullText: fullText, constraints: cr.results, warnings: [...cr.warnings, `Executor failed on ${minibatchEval.executorFailureCount} minibatch example(s); rejected fail-closed.`], gateResults }, null, 2));
+      options.onProgress?.("iteration", `${iter} rejected: executor failed on ${minibatchEval.executorFailureCount} minibatch example(s) (fail-closed)`);
+      continue;
+    }
     const minibatchScore = minibatchEval.aggregate.composite;
     if (minibatchScore < comparisonMinibatchScore - 1e-9) {
       minibatchFilteredCount += 1;
@@ -812,14 +951,20 @@ async function runTypeScriptEvolution(options: {
     options.onProgress?.("iteration", `${iter} judge on validation`);
     const execLogDir = path.join(runDir, "executor", String(iter));
     const { evaluation, traces: cTraces } = await evaluateArtifact({ cwd: options.cwd, model: options.model, thinkingLevel: options.thinkingLevel, target, artifactText: fullText, objective: options.objective, examples: validation, maxBytes, signal: options.signal, useRealExecutor: true, executorLogDir: execLogDir, artifactName: draft.name });
-    // Drift
+    // Drift. An unavailable drift judge blocks the candidate (fail-closed) — it is never mapped
+    // to a passing score.
     let driftScore: number | undefined;
     if (constraintConfig.checkSemanticDrift) {
       options.onProgress?.("drift", draft.name);
       const d = await computeSemanticDrift(options.cwd, target.body, draft.candidateBody, options.objective, options.model, options.thinkingLevel, options.signal);
-      driftScore = d.score;
-      cr.results.push({ name: "semantic_drift" as ConstraintName, passed: d.score <= constraintConfig.maxDriftScore, message: `Drift: ${d.score.toFixed(3)} (max ${constraintConfig.maxDriftScore}). ${d.feedback}` });
-      if (d.score > constraintConfig.maxDriftScore) cr.warnings.push(`Semantic drift too high: ${d.score.toFixed(3)}`);
+      if (d.status === "ok" && d.score !== undefined) {
+        driftScore = d.score;
+        cr.results.push({ name: "semantic_drift" as ConstraintName, passed: d.score <= constraintConfig.maxDriftScore, message: `Drift: ${d.score.toFixed(3)} (max ${constraintConfig.maxDriftScore}). ${d.feedback}` });
+        if (d.score > constraintConfig.maxDriftScore) cr.warnings.push(`Semantic drift too high: ${d.score.toFixed(3)}`);
+      } else {
+        cr.results.push({ name: "semantic_drift" as ConstraintName, passed: false, message: `Drift unmeasurable (fail-closed): ${d.feedback}` });
+        cr.warnings.push("Semantic drift could not be measured; candidate blocked fail-closed.");
+      }
     }
     // Test gate
     let testPassed: boolean | undefined;
@@ -831,10 +976,14 @@ async function runTypeScriptEvolution(options: {
     }
     const constraintsPass = cr.results.every((r) => r.passed); const composite = evaluation.aggregate.composite;
     const scoreDelta = composite - comparisonValidationScore;
-    // "Accepted" now means "cleared constraints/test gate on a full validation pass" — it is
-    // added to the Pareto pool regardless of whether its aggregate beats the parent, because the
-    // pool wants diverse per-instance strengths to sample from, not just a chain of monotone wins.
-    const accepted = constraintsPass && (testPassed === undefined ? true : testPassed);
+    const validationExecutorClean = (evaluation.executorFailureCount ?? 0) === 0;
+    if (!validationExecutorClean) cr.warnings.push(`Executor failed on ${evaluation.executorFailureCount} validation example(s); candidate blocked fail-closed.`);
+    // "Accepted" means "cleared every hard gate on a clean, fully executor-grounded validation
+    // pass" — it is added to the Pareto pool regardless of whether its aggregate beats the
+    // parent, because the pool wants diverse per-instance strengths to sample from, not just a
+    // chain of monotone wins. An evaluation with executor failures is not a valid measurement
+    // and can neither accept the candidate nor enter the pool.
+    const accepted = constraintsPass && validationExecutorClean && (testPassed === undefined ? true : testPassed);
     const candidateRecord: CandidateRecord = { ...draft, candidateFullText: fullText, evaluation, executionTraces: cTraces, constraints: cr.results, warnings: cr.warnings, semanticDriftScore: driftScore, testPassed, gateResults, parentCandidates: parentNames, selectionMethod, minibatchScore };
     const iterRecord: IterationRecord = { iteration: iter, parentCandidate: parentNames[0], parentCandidates: parentNames, mutationRationale: draft.rationale, reflectionPrompt: recordedReflection, candidate: { name: draft.name, rationale: draft.rationale, candidateBody: draft.candidateBody }, evaluation, traces: cTraces, scoreDelta, accepted, gateResults, selectionMethod, paretoFrontierSize: reportedFrontierSize, minibatchFiltered: false };
     iterations.push(iterRecord); await safeWriteFile(path.join(runDir, "iterations", `${iter}.json`), JSON.stringify({ ...iterRecord, candidateFullText: fullText, constraints: cr.results, warnings: cr.warnings, semanticDriftScore: driftScore, testPassed, gateResults }, null, 2));
@@ -854,68 +1003,77 @@ async function runTypeScriptEvolution(options: {
     }
   }
   if (candidates.length === 0) {
-    // Fallback: take the best fully-validated iteration even if not strictly accepted. Only
-    // `minibatchFiltered === false` records carry a genuine evaluation of the DRAFT ITSELF —
-    // constraint/gate rejections and minibatch-filtered records store the PARENT's (or a
-    // partial) evaluation on the iterRecord, so promoting one of those would present a body
-    // under a score that was never actually measured for it.
-    const fullyEvaluated = iterations.filter((it) => it.minibatchFiltered === false);
-    if (fullyEvaluated.length > 0) {
-      const best = [...fullyEvaluated].sort((a, b) => b.evaluation.aggregate.composite - a.evaluation.aggregate.composite)[0]!;
-      const fullText = reassembleArtifact(target.frontmatter, best.candidate.candidateBody);
-      const cr = validateConstraints(target, best.candidate.candidateBody, fullText, constraintConfig);
-      options.onProgress?.("iterations", `Fallback acceptance: no iteration met strict criteria; promoting "${best.candidate.name}" (composite=${best.evaluation.aggregate.composite.toFixed(3)})`);
-      candidates.push({ ...best.candidate, candidateFullText: fullText, evaluation: best.evaluation, executionTraces: best.traces, constraints: cr.results, warnings: [...cr.warnings, "Fallback acceptance: no iteration met strict acceptance criteria."], semanticDriftScore: undefined, testPassed: undefined, wasFallbackPromoted: true, gateResults: best.gateResults, parentCandidates: best.parentCandidates, selectionMethod: best.selectionMethod });
-    } else {
-      // Nothing this run ever cleared constraints, the tiered gate, or the minibatch filter for a
-      // full validation pass — every candidate() would be a body that was never actually measured
-      // at the score we'd have to borrow from its parent to report. Rather than promote a
-      // mislabeled draft (or throw and abort the whole multi-iteration run over one bad artifact),
-      // retain the baseline itself: its `baselineValidation` evaluation is genuine, and the
-      // holdout confirmation step below will naturally report ~0 improvement.
-      const cr = validateConstraints(target, target.body, target.fullText, constraintConfig);
-      options.onProgress?.("iterations", "Fallback: no iteration passed constraints, the tiered gate, or the minibatch filter; retaining baseline.");
-      candidates.push({
-        name: "baseline",
-        rationale: "No mutation or merge this run cleared constraints, the tiered gate, or the minibatch pre-filter; baseline retained unchanged.",
-        candidateBody: target.body,
-        candidateFullText: target.fullText,
-        evaluation: baselineValidation,
-        executionTraces: [],
-        constraints: cr.results,
-        warnings: [...cr.warnings, "Fallback acceptance: no iteration passed constraints/gates/minibatch filter this run."],
-        wasFallbackPromoted: true,
-      });
-    }
+    // No candidate passed every hard gate this run. There is NO recovery path around hard
+    // constraints: a draft that failed (or never completed) constraints, the tiered gate, drift,
+    // tests, or a clean executor-grounded validation pass is never promoted, regardless of how
+    // well it scored. The only fallback outcome is retaining the baseline itself — its
+    // `baselineValidation` evaluation is genuine — reported as a no-safe-improvement run.
+    const cr = validateConstraints(target, target.body, target.fullText, constraintConfig);
+    options.onProgress?.("iterations", "No candidate passed every hard gate; retaining baseline (no safe improvement).");
+    candidates.push({
+      name: "baseline",
+      rationale: "No mutation or merge this run passed every hard gate (constraints, tiered gate, drift, tests, clean executor measurement); baseline retained unchanged.",
+      candidateBody: target.body,
+      candidateFullText: target.fullText,
+      evaluation: baselineValidation,
+      executionTraces: [],
+      constraints: cr.results,
+      warnings: [...cr.warnings, "No safe improvement: no iteration passed every hard gate this run."],
+      wasFallbackPromoted: true,
+    });
   }
   candidates.sort((a, b) => b.evaluation.aggregate.composite - a.evaluation.aggregate.composite);
   const bestCandidate = candidates[0]!;
   const finalFrontier = computeParetoFrontier(pool).frontier.map((p) => p.name);
-  options.onProgress?.("confirm", `${bestCandidate.name} on holdout`);
-  // Executor-grounded, matching baselineHoldout's regime above — `improvement` (below) is a
-  // difference of these two, and comparing a judged-real-behavior score against a judged-prose
-  // one would make the headline number meaningless.
-  const { evaluation: bestHoldoutEvaluation, traces: bestHoldoutTraces } = await evaluateArtifact({
-    cwd: options.cwd,
-    model: options.model,
-    thinkingLevel: options.thinkingLevel,
-    target,
-    artifactText: bestCandidate.candidateFullText,
-    objective: options.objective,
-    examples: holdout,
-    maxBytes,
-    signal: options.signal,
-    useRealExecutor: true,
-    executorLogDir: path.join(runDir, "executor", "confirm"),
-    artifactName: slugify(bestCandidate.name) || "best-candidate",
-  });
-  bestCandidate.holdoutEvaluation = bestHoldoutEvaluation;
-  bestCandidate.executionTraces.push(...bestHoldoutTraces);
-  const improvement = bestHoldoutEvaluation.aggregate.composite - baselineHoldout.aggregate.composite;
+  let improvement: number;
+  if (bestCandidate.wasFallbackPromoted) {
+    // The retained "winner" IS the baseline text: re-running the executor on the identical
+    // artifact would only measure evaluation noise and report it as improvement. Reuse the
+    // baseline's own holdout measurement and report exactly zero.
+    options.onProgress?.("confirm", "baseline retained; reusing baseline holdout measurement");
+    bestCandidate.holdoutEvaluation = baselineHoldout;
+    improvement = 0;
+  } else {
+    options.onProgress?.("confirm", `${bestCandidate.name} on holdout`);
+    // Executor-grounded, matching baselineHoldout's regime above — `improvement` (below) is a
+    // difference of these two, and comparing a judged-real-behavior score against a judged-prose
+    // one would make the headline number meaningless.
+    const { evaluation: bestHoldoutEvaluation, traces: bestHoldoutTraces } = await evaluateArtifact({
+      cwd: options.cwd,
+      model: options.model,
+      thinkingLevel: options.thinkingLevel,
+      target,
+      artifactText: bestCandidate.candidateFullText,
+      objective: options.objective,
+      examples: holdout,
+      maxBytes,
+      signal: options.signal,
+      useRealExecutor: true,
+      executorLogDir: path.join(runDir, "executor", "confirm"),
+      artifactName: slugify(bestCandidate.name) || "best-candidate",
+    });
+    bestCandidate.holdoutEvaluation = bestHoldoutEvaluation;
+    bestCandidate.executionTraces.push(...bestHoldoutTraces);
+    improvement = bestHoldoutEvaluation.aggregate.composite - baselineHoldout.aggregate.composite;
+  }
 
-  // PR
+  // PR. Promotion to a branch/PR requires ALL of: a candidate that passed every hard gate (never
+  // the fallback-retained baseline), a positive holdout improvement, and clean executor-grounded
+  // measurements on both sides of that holdout comparison.
+  const holdoutMeasurementClean = (baselineHoldout.executorFailureCount ?? 0) === 0
+    && ((bestCandidate.holdoutEvaluation?.executorFailureCount) ?? 0) === 0;
+  const promotionBlockedReason = bestCandidate.wasFallbackPromoted
+    ? "no candidate passed every hard gate"
+    : !holdoutMeasurementClean
+      ? "executor failures during holdout measurement"
+      : improvement <= 0
+        ? "no positive holdout improvement"
+        : undefined;
   let prResult: PRAutomationResult | undefined;
-  if (options.createPR && improvement > 0) { options.onProgress?.("pr", "Creating branch"); prResult = await createGitBranchWithCandidate(target, bestCandidate, improvement, runDir, path.join(runDir, "report.md"), options.objective, modelLabel, baselineTraces, candidates, options.cwd); }
+  if (options.createPR) {
+    if (promotionBlockedReason === undefined) { options.onProgress?.("pr", "Creating branch"); prResult = await createGitBranchWithCandidate(target, bestCandidate, improvement, runDir, path.join(runDir, "report.md"), options.objective, modelLabel, baselineTraces, candidates, options.cwd); }
+    else options.onProgress?.("pr", `Skipped: ${promotionBlockedReason}`);
+  }
 
   const reportPath = path.join(runDir, "report.md"); const originalPath = path.join(runDir, "original.md");
   const bestCandidatePath = path.join(runDir, "best-candidate.md"); const datasetPath = path.join(runDir, "dataset.json");
@@ -995,6 +1153,12 @@ async function runTypeScriptEvolution(options: {
       mergeAttempts,
       minibatchFilteredCount,
     },
+    promotion: {
+      eligible: promotionBlockedReason === undefined,
+      blockedReason: promotionBlockedReason ?? null,
+      baselineHoldoutExecutorFailures: baselineHoldout.executorFailureCount ?? 0,
+      bestHoldoutExecutorFailures: bestCandidate.holdoutEvaluation?.executorFailureCount ?? 0,
+    },
     traces: { baselineCount: baselineTraces.length },
     prBranch: prResult?.branch ?? null,
     createdAt: new Date().toISOString(),
@@ -1037,8 +1201,8 @@ export async function runEvolution(options: {
   candidateCount: number; maxExamples: number; sessionQuery?: string; backend?: "auto" | "typescript" | "python";
   goldenTaskId?: string; testCommand?: string; testTimeout?: number; createPR?: boolean; persistGolden?: boolean;
   seed?: number; cohortExamples?: EvalExample[];
-  cohortJudgeFunc?: (examples: EvalExample[]) => Promise<{ composite: number }>;
-  coherenceCheck?: () => Promise<{ passed: boolean; detail: string }>;
+  cohortJudgeFunc?: (artifactText: string, examples: EvalExample[]) => Promise<{ composite: number }>;
+  coherenceCheck?: (candidateText: string) => Promise<{ passed: boolean; detail: string }>;
   tsConfigPath?: string;
   signal?: AbortSignal; onProgress?: (phase: string, detail?: string) => void;
 }): Promise<EvolutionSummaryDetails> {

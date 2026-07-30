@@ -55,6 +55,13 @@ export interface AggregateScore {
 export interface ArtifactEvaluation {
   aggregate: AggregateScore;
   examples: ExampleEvaluation[];
+  /**
+   * Number of examples in this evaluation whose real-executor run failed (spawn error, non-zero
+   * exit, or timeout, after one retry) when `useRealExecutor` was requested. Any value > 0 means
+   * the aggregate mixes executor-grounded and judge-estimated observations, so the evaluation
+   * must not be used to accept a candidate or justify promotion (fail closed).
+   */
+  executorFailureCount?: number;
 }
 
 export interface CandidateDraft {
@@ -122,9 +129,21 @@ export interface PRAutomationResult {
   diffStat: string;
 }
 
+export interface SecretSpan {
+  start: number;
+  end: number;
+  ruleId: string;
+}
+
 export interface SecretScanResult {
   found: boolean;
+  /**
+   * Human-readable findings. `match` never contains secret material — only the rule id and the
+   * character span. Redaction operates on `spans`, not on these labels.
+   */
   patterns: Array<{ pattern: string; match: string; location: string }>;
+  /** Exact character spans of every match, for span-based redaction. */
+  spans: SecretSpan[];
 }
 
 export interface GoldenDatasetManifest {
@@ -151,10 +170,10 @@ export interface CandidateRecord extends CandidateDraft {
   executionObservation?: ExecutionObservation;
   gateResults?: TieredGateResult[];
   /**
-   * True when this candidate was promoted by the engine's fallback acceptance
-   * path because no iteration met the strict score-delta + constraints gate.
-   * Surfaced in manifest.json#bestCandidate so downstream tools can detect
-   * degenerate "winner" promotion without spelunking `warnings`.
+   * True when no iteration passed every hard gate this run and the engine retained the baseline
+   * artifact unchanged as the "winner". A gate-failing draft is never promoted — the only
+   * fallback outcome is the baseline itself. Surfaced in manifest.json#bestCandidate so
+   * downstream tools can detect a no-safe-improvement run without spelunking `warnings`.
    */
   wasFallbackPromoted?: boolean;
   /**
@@ -188,10 +207,14 @@ export interface EvolutionOptions {
   seed?: number;
   /** Cohort of EvalExamples used by the tiered gate's cohort-regression tier. */
   cohortExamples?: EvalExample[];
-  /** Judge callback invoked by the tiered gate to score the cohort. Required when cohortExamples is supplied. */
-  cohortJudgeFunc?: (examples: EvalExample[]) => Promise<{ composite: number }>;
-  /** Coherence check callback invoked by the tiered gate's coherence tier. */
-  coherenceCheck?: () => Promise<{ passed: boolean; detail: string }>;
+  /**
+   * Judge callback invoked by the tiered gate to score an artifact text on the cohort. The gate
+   * calls it for both the baseline and each candidate on the SAME cohort, so the regression
+   * delta is a paired comparison. Required when cohortExamples is supplied.
+   */
+  cohortJudgeFunc?: (artifactText: string, examples: EvalExample[]) => Promise<{ composite: number }>;
+  /** Coherence check callback invoked by the tiered gate's coherence tier with the candidate text under evaluation. */
+  coherenceCheck?: (candidateText: string) => Promise<{ passed: boolean; detail: string }>;
   /** Override the tsconfig path the tiered-gate typecheck tier runs against. Useful for forcing typecheck-tier failure in test scenarios. */
   tsConfigPath?: string;
 }
@@ -285,12 +308,21 @@ export interface ExecutionObservation {
   capturedFiles?: Record<string, string>;
 }
 
+export type GateStatus = "pass" | "fail" | "unknown";
+
 export interface TieredGateResult {
   tier: "typecheck" | "cohort" | "coherence";
   passed: boolean;
   reasonCode: string;
   detail: string;
   durationMs: number;
+  /**
+   * Tri-state outcome distinguishing a genuine verdict from evaluator uncertainty: "pass"/"fail"
+   * are real measurements; "unknown" means the tier itself errored (judge outage, callback threw)
+   * and the candidate is blocked without being scored — never mapped to a plausible number.
+   * Absent on results written before this field existed; treat those as pass/fail per `passed`.
+   */
+  status?: GateStatus;
 }
 
 export interface LineageEntry {

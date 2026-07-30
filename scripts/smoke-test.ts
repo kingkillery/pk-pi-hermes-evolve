@@ -40,8 +40,8 @@ type RunEvolutionFn = (options: {
   onProgress?: (phase: string, detail?: string) => void;
   seed?: number;
   cohortExamples?: EvalExample[];
-  cohortJudgeFunc?: (examples: EvalExample[]) => Promise<{ composite: number }>;
-  coherenceCheck?: () => Promise<{ passed: boolean; detail: string }>;
+  cohortJudgeFunc?: (artifactText: string, examples: EvalExample[]) => Promise<{ composite: number }>;
+  coherenceCheck?: (candidateText: string) => Promise<{ passed: boolean; detail: string }>;
   tsConfigPath?: string;
 }) => Promise<unknown>;
 
@@ -156,9 +156,11 @@ async function listRunDirsAfter(startedAt: number): Promise<string[]> {
 }
 
 async function ensureFixtureRestored(): Promise<string> {
-  // The engine's createGitBranchWithCandidate path overwrites the target file.
-  // We never set createPR, so the file should be untouched, but defensively
-  // capture the original bytes so we can restore if anything mutates it.
+  // The engine's testCommand gate writes the candidate to the target file
+  // temporarily, and older engine versions also overwrote it during PR
+  // automation. We set neither option, so the file should stay untouched, but
+  // defensively capture the original bytes so we can restore if anything
+  // mutates it.
   return await fs.readFile(TARGET_PATH, "utf8");
 }
 
@@ -201,7 +203,10 @@ function buildModeCallbacks(mode: MockMode): Pick<Parameters<RunEvolutionFn>[0],
     ];
     return {
       cohortExamples: dummyExamples,
-      cohortJudgeFunc: async () => ({ composite: 0.1 }),
+      // The gate now judges baseline and candidate on the SAME cohort (paired comparison), so a
+      // forced regression must score the baseline high and any mutated candidate low. Forced-mode
+      // candidate bodies contain the "Forced-cohort-regression" marker; the fixture baseline does not.
+      cohortJudgeFunc: async (artifactText: string) => ({ composite: artifactText.includes("Forced-cohort-regression") ? 0.1 : 0.9 }),
     };
   }
   if (mode === "force-coherence-fail") {

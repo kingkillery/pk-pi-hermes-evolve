@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Evaluation-architecture correctness fixes
+
+Hard gates are now fail-closed with no recovery path, and every promotion decision rests on paired, executor-grounded measurements:
+
+- **never promote a gate-failing candidate**: the fallback path that promoted the best fully-evaluated iteration even when `accepted === false` (clearing its drift/test results in the process) is removed; when no iteration passes every hard gate the engine retains the baseline as a "no safe improvement" outcome, reuses the baseline's own holdout measurement (improvement is exactly 0 instead of re-measured noise), and records `promotion.blockedReason` in `manifest.json`
+- **paired, candidate-aware tiered gate**: `cohortJudgeFunc` now receives the artifact text under evaluation, and the cohort tier compares the candidate against a baseline judged once per run on the SAME cohort — previously the candidate's cohort score was compared against the sealed holdout baseline aggregate (an unpaired cross-split comparison that also leaked the holdout into search); `coherenceCheck` receives the candidate text explicitly
+- **fail closed on evaluator uncertainty**: `TieredGateResult` gains a tri-state `status` (`pass`/`fail`/`unknown`) — judge/callback outages report `cohort_judge_error`/`coherence_error` as `unknown` instead of masquerading as measured regressions; a drift-judge failure blocks the candidate instead of fabricating a passing 0.2 score; real-executor calls retry once and any remaining failure marks the evaluation (`ArtifactEvaluation.executorFailureCount`) so it can neither accept a candidate, enter the Pareto pool, nor justify a PR
+- **real execution traces feed reflection**: the train-subset reflection minibatch is now executor-grounded for every pool entry (baseline, ancestor seed, and candidates), so mutation prompts see genuine pi transcripts under `hasRealExecution` while validation/holdout stay hidden from the proposer; baseline holdout/validation executor traces are also retained for reporting
+- **span-based secret redaction**: `scanForSecrets` returns exact character spans for EVERY match (global, all rules) and findings no longer embed a preview of the matched secret; new `redactSecrets` replaces merged spans back-to-front, fixing the old preview-string `replace` that usually left the full secret in place and only handled the first match
+- **PR automation in a disposable worktree**: the winning candidate is committed on a new branch inside a temporary `git worktree` (removed in `finally`) and the PR is opened via the `gh` CLI — previously the code ran `git pr create` (not a git subcommand, so no PR was ever created) and switched branches/overwrote the target file in the caller's active checkout
+- **promotion gating**: `createPR` requires a strictly-accepted candidate, a positive holdout improvement, and clean executor measurements on both sides of the holdout comparison; the decision and reason are persisted under `manifest.json#promotion`
+
 ### Improvement-impact fixes for the evolution loop
 
 Five changes targeting measurement validity and compounding, so that reported "improvement" reflects real gains rather than evaluation artifacts:
