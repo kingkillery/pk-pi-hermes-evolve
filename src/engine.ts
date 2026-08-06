@@ -46,6 +46,12 @@ const JUDGE_SYSTEM_PROMPT = `You are a strict evaluator for agent instruction ar
 Estimate how an agent following the provided artifact would likely respond to a task.
 Return strict JSON only. Be conservative, concrete, and terse.`;
 
+const RUBRIC_PRESETS: Record<string, string> = {
+  skill: "For skill artifacts: weight correctness (0.5) heavily — does the agent complete the task correctly when following these instructions? Procedure following (0.3) checks whether the agent follows the skill's steps in order. Conciseness (0.2) rewards tight trigger conditions and clear step sequencing.",
+  prompt: "For prompt artifacts: weight conciseness (0.4) — a good prompt template is compact and avoids redundant prose. Correctness (0.35) checks whether the prompt produces the right output. Procedure following (0.25) checks format compliance.",
+  instructions: "For instruction artifacts (AGENTS.md, SYSTEM.md, etc.): weight procedure following (0.4) — does the agent respect the stated policies and constraints? Correctness (0.4) checks whether behaviors match the stated intent. Conciseness (0.2) rewards clear, non-contradictory guidance.",
+};
+
 const CANDIDATE_SYSTEM_PROMPT = `You improve instruction artifacts using reflective search.
 Return strict JSON only. Do not include markdown fences or commentary outside the JSON.`;
 
@@ -465,6 +471,7 @@ function buildTrace(artifactText: string, example: EvalExample, judged: JudgeRes
 async function evaluateArtifact(options: { cwd: string; model?: string; thinkingLevel?: string; target: ArtifactTarget; artifactText: string; objective: string; examples: EvalExample[]; maxBytes: number; signal?: AbortSignal; onProgress?: (detail: string) => void; useRealExecutor?: boolean; executorLogDir?: string; artifactName?: string }): Promise<{ evaluation: ArtifactEvaluation; traces: ExecutionTrace[]; executorObservations?: ExecutionObservation[] }> {
   const evals: ExampleEvaluation[] = []; const traces: ExecutionTrace[] = []; const observations: ExecutionObservation[] = [];
   let executorFailureCount = 0;
+  const rubricHint = RUBRIC_PRESETS[options.target.type] ?? "";
   for (let i = 0; i < options.examples.length; i += 1) {
     const ex = options.examples[i]!; options.onProgress?.(`Judging ${i + 1}/${options.examples.length}`);
     let executorContext = ""; let observation: ExecutionObservation | undefined;
@@ -500,7 +507,8 @@ async function evaluateArtifact(options: { cwd: string; model?: string; thinking
     const scoringInstruction = observation
       ? "Score the OBSERVED agent transcript above against the rubric — you do not have the artifact's instruction text, only what the agent actually did."
       : "Score how well an agent following the artifact text above would likely satisfy the rubric.";
-    const prompt = [`Artifact type: ${options.target.type}`, `Objective: ${options.objective}`, `Path: ${options.target.path}`, ...textBlock, "", `Task: ${ex.taskInput}`, `Rubric: ${ex.expectedBehavior}`, `Difficulty: ${ex.difficulty}`, `Category: ${ex.category}`, executorContext, "", scoringInstruction, 'Return JSON: {"responsePreview":"...","correctness":0.0,"procedureFollowing":0.0,"conciseness":0.0,"feedback":"...","confidence":0.0}'].join("\n");
+    const rubricLines = rubricHint ? [`Rubric guidance: ${rubricHint}`] : [];
+    const prompt = [`Artifact type: ${options.target.type}`, `Objective: ${options.objective}`, `Path: ${options.target.path}`, ...rubricLines, ...textBlock, "", `Task: ${ex.taskInput}`, `Rubric: ${ex.expectedBehavior}`, `Difficulty: ${ex.difficulty}`, `Category: ${ex.category}`, executorContext, "", scoringInstruction, 'Return JSON: {"responsePreview":"...","correctness":0.0,"procedureFollowing":0.0,"conciseness":0.0,"feedback":"...","confidence":0.0}'].join("\n");
     const raw = await runPiTextTask({ cwd: options.cwd, model: options.model, thinkingLevel: options.thinkingLevel, systemPrompt: JUDGE_SYSTEM_PROMPT, prompt, signal: options.signal });
     const j = normalizeJudgeResult(extractJsonPayload(raw));
     if (observation && !j.responsePreview) j.responsePreview = observation.stdout.slice(0, 500);
@@ -656,6 +664,94 @@ async function generateMergeCandidateDraft(options: { cwd: string; model?: strin
 
 async function safeWriteFile(filePath: string, content: string): Promise<void> { await fs.mkdir(path.dirname(filePath), { recursive: true }); await withFileMutationQueue(filePath, async () => { await fs.writeFile(filePath, content, "utf8"); }); }
 
+function computeUnifiedDiff(label: string, original: string, candidate: string): string {
+  const origLines = original.split("\n");
+  const candLines = candidate.split("\n");
+
+  // Myers LCS-based diff — build edit script with context
+  const m = origLines.length;
+  const n = candLines.length;
+
+  // Compute LCS length table
+  const dp: number[][] = Array.from({ length: m + 1 }, () => new Array<number>(n + 1).fill(0));
+  for (let i = m - 1; i >= 0; i -= 1) {
+    for (let j = n - 1; j >= 0; j -= 1) {
+      if (origLines[i] === candLines[j]) {
+        dp[i]![j] = (dp[i + 1]?.[j + 1] ?? 0) + 1;
+      } else {
+        dp[i]![j] = Math.max(dp[i + 1]?.[j] ?? 0, dp[i]?.[j + 1] ?? 0);
+      }
+    }
+  }
+
+  // Build edit ops: "=" keep, "-" delete, "+" insert
+  const ops: Array<{ op: "=" | "-" | "+"; line: string }> = [];
+  let i = 0; let j = 0;
+  while (i < m || j < n) {
+    if (i < m && j < n && origLines[i] === candLines[j]) {
+      ops.push({ op: "=", line: origLines[i]! });
+      i += 1; j += 1;
+    } else if (j < n && (i >= m || (dp[i]?.[j + 1] ?? 0) >= (dp[i + 1]?.[j] ?? 0))) {
+      ops.push({ op: "+", line: candLines[j]! });
+      j += 1;
+    } else {
+      ops.push({ op: "-", line: origLines[i]! });
+      i += 1;
+    }
+  }
+
+  // Collect hunks with 3 lines of context
+  const CONTEXT = 3;
+  const hunks: string[][] = [];
+  let hunk: string[] | null = null;
+  let trailingContext = 0;
+  let origPos = 1; let candPos = 1;
+  let hunkOrigStart = 1; let hunkCandStart = 1;
+  let hunkOrigCount = 0; let hunkCandCount = 0;
+
+  const flushHunk = () => {
+    if (hunk && hunk.length > 0) {
+      hunk.unshift(`@@ -${hunkOrigStart},${hunkOrigCount} +${hunkCandStart},${hunkCandCount} @@`);
+      hunks.push(hunk);
+    }
+    hunk = null; trailingContext = 0;
+  };
+
+  const pendingContext: string[] = [];
+
+  for (const { op, line } of ops) {
+    if (op === "=") {
+      if (hunk) {
+        hunk.push(` ${line}`);
+        hunkOrigCount += 1; hunkCandCount += 1;
+        trailingContext += 1;
+        if (trailingContext >= CONTEXT * 2) flushHunk();
+      } else {
+        pendingContext.push(` ${line}`);
+        if (pendingContext.length > CONTEXT) pendingContext.shift();
+      }
+      origPos += 1; candPos += 1;
+    } else {
+      if (!hunk) {
+        hunk = [...pendingContext];
+        const ctxCount = pendingContext.length;
+        hunkOrigStart = origPos - ctxCount;
+        hunkCandStart = candPos - ctxCount;
+        hunkOrigCount = ctxCount; hunkCandCount = ctxCount;
+        pendingContext.length = 0;
+      }
+      trailingContext = 0;
+      if (op === "-") { hunk.push(`-${line}`); hunkOrigCount += 1; origPos += 1; }
+      else { hunk.push(`+${line}`); hunkCandCount += 1; candPos += 1; }
+    }
+  }
+  flushHunk();
+
+  if (hunks.length === 0) return `--- ${label} (original)\n+++ ${label} (best-candidate)\n(no textual changes)\n`;
+  const header = `--- ${label} (original)\n+++ ${label} (best-candidate)\n`;
+  return header + hunks.map((h) => h.join("\n")).join("\n") + "\n";
+}
+
 function buildReportMarkdown(result: EvolutionRunResult): string {
   const baselineValidation = result.baselineValidation.aggregate.composite;
   const bestValidation = result.bestCandidate.evaluation.aggregate.composite;
@@ -663,6 +759,11 @@ function buildReportMarkdown(result: EvolutionRunResult): string {
   const bestHoldout = result.bestCandidate.holdoutEvaluation?.aggregate.composite ?? bestValidation;
   const totalTraces = result.baselineTraces.length + result.candidates.reduce((s, c) => s + c.executionTraces.length, 0);
   const failures = [...result.baselineTraces, ...result.candidates.flatMap((c) => c.executionTraces)].filter((t) => t.isFailure);
+  const diffText = computeUnifiedDiff(result.target.name, result.target.body, result.bestCandidate.candidateBody);
+  const diffLines = diffText.split("\n").length;
+  const diffPreview = diffText.length > 4000
+    ? `${diffText.slice(0, 4000).trimEnd()}\n… (truncated — full diff in diff.patch)`
+    : diffText.trimEnd();
   return [
     "# Hermes-style Self-Evolution Report", "",
     `- **Target:** ${result.target.path}`, `- **Type:** ${result.target.type}`, `- **Objective:** ${result.objective}`,
@@ -688,6 +789,13 @@ function buildReportMarkdown(result: EvolutionRunResult): string {
     ...result.bestCandidate.constraints.map((c) => `- ${c.passed ? "✅" : "❌"} **${c.name}**: ${c.message}`),
     `- **Drift:** ${result.bestCandidate.semanticDriftScore?.toFixed(3) ?? "not checked"}`,
     "",
+    "## Diff (original → best candidate)",
+    `_${diffLines} lines — see \`diff.patch\` for the full patch._`,
+    "",
+    "```diff",
+    diffPreview,
+    "```",
+    "",
     "## Selected winner confirmation",
     `- **Winner chosen on:** ${result.selectionSplit}`,
     `- **Validation score:** ${bestValidation.toFixed(3)}`,
@@ -696,7 +804,7 @@ function buildReportMarkdown(result: EvolutionRunResult): string {
     "### Holdout weaknesses",
     summarizeWeaknesses(result.bestCandidate.holdoutEvaluation ?? result.bestCandidate.evaluation, 3),
     result.prResult ? `\n## PR\n- **Branch:** ${result.prResult.branch}\n- **Commit:** ${result.prResult.commitSha.slice(0, 12)}\n- **URL:** ${result.prResult.prUrl ?? "not created"}` : "",
-    "", "## Files", `- Original: ${result.paths.originalPath}`, `- Best: ${result.paths.bestCandidatePath}`, `- Dataset: ${result.paths.datasetPath}`, `- Manifest: ${result.paths.manifestPath}`, `- Traces: ${result.paths.runDir}/traces/`, `- Report: ${result.paths.reportPath}`,
+    "", "## Files", `- Original: ${result.paths.originalPath}`, `- Best: ${result.paths.bestCandidatePath}`, `- Diff: ${result.paths.runDir}/diff.patch`, `- Dataset: ${result.paths.datasetPath}`, `- Manifest: ${result.paths.manifestPath}`, `- Traces: ${result.paths.runDir}/traces/`, `- Report: ${result.paths.reportPath}`,
   ].join("\n");
 }
 
@@ -1123,6 +1231,7 @@ async function runTypeScriptEvolution(options: {
     usedPersistedGolden,
     baselineValidation: baselineValidation.aggregate,
     baselineHoldout: baselineHoldout.aggregate,
+    bestCandidateName: bestCandidate.name,
     bestCandidate: {
       name: bestCandidate.name,
       rationale: bestCandidate.rationale,
@@ -1164,6 +1273,7 @@ async function runTypeScriptEvolution(options: {
     createdAt: new Date().toISOString(),
   }, null, 2));
   await safeWriteFile(reportPath, buildReportMarkdown(result));
+  await safeWriteFile(path.join(runDir, "diff.patch"), computeUnifiedDiff(target.name, target.body, bestCandidate.candidateBody));
   for (const c of candidates) { const p = slugify(c.name) || "candidate"; await safeWriteFile(path.join(runDir, "candidates", `${p}.md`), c.candidateFullText); await safeWriteFile(path.join(runDir, "candidates", `${p}.json`), JSON.stringify({ rationale: c.rationale, warnings: c.warnings, evaluation: c.evaluation, holdoutEvaluation: c.holdoutEvaluation, constraints: c.constraints, semanticDriftScore: c.semanticDriftScore, testPassed: c.testPassed }, null, 2)); }
   const allTraces = [...baselineTraces.map((t) => ({ ...t, phase: "baseline" as const })), ...candidates.flatMap((c) => c.executionTraces.map((t) => ({ ...t, phase: `candidate/${c.name}` as const })))];
   await safeWriteFile(path.join(tracesDir, "all-traces.json"), JSON.stringify(allTraces, null, 2));
@@ -1225,5 +1335,50 @@ export function toToolSummaryDetails(result: EvolutionRunResult): EvolutionSumma
   const allTraces = [...result.baselineTraces, ...result.candidates.flatMap((c) => c.executionTraces)];
   return { runDir: result.paths.runDir, reportPath: result.paths.reportPath, targetPath: result.target.path, objective: result.objective, evalSource: result.evalSource, modelLabel: result.modelLabel, selectionSplit: result.selectionSplit, confirmationSplit: result.confirmationSplit, trainExamples: result.trainExamples.length, validationExamples: result.validationExamples.length, holdoutExamples: result.holdoutExamples.length, goldenTaskId: result.golden?.id ?? null, candidateCount: result.candidates.length, baselineValidationScore: result.baselineValidation.aggregate.composite, bestValidationScore: result.bestCandidate.evaluation.aggregate.composite, baselineHoldoutScore: result.baselineHoldout.aggregate.composite, bestHoldoutScore: result.bestCandidate.holdoutEvaluation?.aggregate.composite ?? result.bestCandidate.evaluation.aggregate.composite, improvement: result.improvement, bestCandidateName: result.bestCandidate.name, tracesCaptured: allTraces.length, constraintsPassed: result.bestCandidate.constraints.length > 0 ? result.bestCandidate.constraints.every((c) => c.passed) : true, testGatePassed: result.bestCandidate.testPassed, semanticDriftScore: result.bestCandidate.semanticDriftScore, prBranch: result.prResult?.branch, backend: "typescript", optimizerUsed: "gepa-pareto" };
 }
+
+export interface ApplyManifest {
+  targetPath: string;
+  /** Top-level field written by both TypeScript and Python backends. */
+  bestCandidateName: string;
+  improvement: number;
+  /** Nested object written by the TypeScript backend — used as fallback when bestCandidateName is absent. */
+  bestCandidate?: { name?: string };
+}
+
+function extractCandidateName(manifest: ApplyManifest): string {
+  return manifest.bestCandidateName || manifest.bestCandidate?.name || "best-candidate";
+}
+
+export async function loadApplyManifest(runDir: string): Promise<ApplyManifest | null> {
+  try {
+    const raw = await fs.readFile(path.join(runDir, "manifest.json"), "utf8");
+    return JSON.parse(raw) as ApplyManifest;
+  } catch {
+    return null;
+  }
+}
+
+export async function applyBestCandidate(runDir: string): Promise<{ targetPath: string; candidateName: string; improvement: number }> {
+  const manifestPath = path.join(runDir, "manifest.json");
+  const bestCandidatePath = path.join(runDir, "best-candidate.md");
+  let manifest: ApplyManifest;
+  try {
+    manifest = JSON.parse(await fs.readFile(manifestPath, "utf8")) as ApplyManifest;
+  } catch {
+    throw new Error(`Cannot read manifest at ${manifestPath}. Is the run directory correct?`);
+  }
+  let candidateContent: string;
+  try {
+    candidateContent = await fs.readFile(bestCandidatePath, "utf8");
+  } catch {
+    throw new Error(`Cannot read best candidate at ${bestCandidatePath}.`);
+  }
+  const targetPath = manifest.targetPath;
+  if (!targetPath) throw new Error("manifest.json missing targetPath.");
+  await withFileMutationQueue(targetPath, async () => { await fs.writeFile(targetPath, candidateContent, "utf8"); });
+  return { targetPath, candidateName: extractCandidateName(manifest), improvement: manifest.improvement ?? 0 };
+}
+
+export { computeUnifiedDiff };
 
 export type { EvolutionSummaryDetails, ToolSummaryDetails } from "./types.js";

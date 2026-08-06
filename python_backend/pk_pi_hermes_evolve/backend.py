@@ -97,6 +97,41 @@ DRIFT_SYSTEM_PROMPT = (
     "Return strict JSON only."
 )
 
+RUBRIC_PRESETS: dict[str, str] = {
+    "skill": (
+        "For skill artifacts: weight correctness (0.5) heavily — does the agent complete the task correctly "
+        "when following these instructions? Procedure following (0.3) checks whether the agent follows the "
+        "skill's steps in order. Conciseness (0.2) rewards tight trigger conditions and clear step sequencing."
+    ),
+    "prompt": (
+        "For prompt artifacts: weight conciseness (0.4) — a good prompt template is compact and avoids "
+        "redundant prose. Correctness (0.35) checks whether the prompt produces the right output. "
+        "Procedure following (0.25) checks format compliance."
+    ),
+    "instructions": (
+        "For instruction artifacts (AGENTS.md, SYSTEM.md, etc.): weight procedure following (0.4) — "
+        "does the agent respect the stated policies and constraints? Correctness (0.4) checks whether "
+        "behaviors match the stated intent. Conciseness (0.2) rewards clear, non-contradictory guidance."
+    ),
+}
+
+
+def _compute_unified_diff(label: str, original: str, candidate: str) -> str:
+    """Return a unified diff between original and candidate text bodies."""
+    import difflib
+    orig_lines = original.splitlines(keepends=True)
+    cand_lines = candidate.splitlines(keepends=True)
+    diff_lines = list(difflib.unified_diff(
+        orig_lines,
+        cand_lines,
+        fromfile=f"{label} (original)",
+        tofile=f"{label} (best-candidate)",
+        lineterm="",
+    ))
+    if not diff_lines:
+        return f"--- {label} (original)\n+++ {label} (best-candidate)\n(no textual changes)\n"
+    return "\n".join(line.rstrip("\n") for line in diff_lines) + "\n"
+
 
 @dataclass
 class SessionSnippet:
@@ -616,6 +651,7 @@ class GenerateDatasetSignature(dspy.Signature):
 class JudgeSignature(dspy.Signature):
     artifact_type: str = dspy.InputField(desc="Artifact type")
     objective: str = dspy.InputField(desc="Improvement objective")
+    rubric_guidance: str = dspy.InputField(desc="Artifact-type-specific scoring guidance")
     artifact_text: str = dspy.InputField(desc="Artifact text")
     task_input: str = dspy.InputField(desc="The user's task")
     expected_behavior: str = dspy.InputField(desc="Rubric describing good behavior")
@@ -763,6 +799,7 @@ def _evaluate_artifact_with_traces(
         prompt_result = judge(
             artifact_type=target["type"],
             objective=objective,
+            rubric_guidance=RUBRIC_PRESETS.get(target["type"], ""),
             artifact_text=artifact_text.strip(),
             task_input=example.task_input,
             expected_behavior=example.expected_behavior,
@@ -1106,6 +1143,7 @@ def run_backend(payload: dict[str, Any]) -> dict[str, Any]:
 
     _write_text(original_path, target["full_text"])
     _write_text(best_path, best.candidate_full_text)
+    _write_text(run_dir / "diff.patch", _compute_unified_diff(target["name"], target["body"], best.candidate_body))
     _write_json(
         dataset_path,
         {
@@ -1203,7 +1241,7 @@ def run_backend(payload: dict[str, Any]) -> dict[str, Any]:
             "# Hermes-style Self-Evolution Report (Python backend)\n\n"
             f"- Selection (validation): {baseline_validation_aggregate.composite:.3f} → {best.aggregate.composite:.3f}\n"
             f"- Confirmation (holdout): {baseline_holdout_aggregate.composite:.3f} → {best_holdout_aggregate.composite:.3f}\n\n"
-            "See manifest.json for full metrics.\n"
+            "See manifest.json for full metrics and diff.patch for the diff.\n"
         ),
     )
 

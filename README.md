@@ -75,6 +75,8 @@ The engine is optimized for **text instructions**, not general code evolution.
 - `/evolve` → interactive artifact picker
 - `/evolve path/to/file.md` → evolve a specific file
 - `/evolve last` → show the last saved report path in the current session
+- `/evolve apply` → apply the best candidate from the last run to the target file (requires `"yes"` confirmation)
+- `/evolve apply .pi/hermes-self-evolution/runs/<run>` → apply the best candidate from a specific run directory
 
 ### Tool
 
@@ -176,7 +178,8 @@ Every run writes to a timestamped directory:
 .pi/hermes-self-evolution/runs/<timestamp>-<artifact>/
 ├── original.md
 ├── best-candidate.md
-├── report.md
+├── diff.patch          ← unified diff: original body → best candidate body
+├── report.md           ← includes embedded diff preview and metrics
 ├── manifest.json
 ├── dataset.json
 └── candidates/
@@ -246,6 +249,12 @@ What is still out of scope versus the full Nous vision:
 - no built-in pytest gate (use `testCommand` to wire one)
 
 This package implements **Hermes Phase 1 in TypeScript** as a first-class pi extension.
+
+Parity gap closures layered on top of Phase 1:
+
+- **diff rendering**: every run writes `diff.patch` and embeds a `## Diff` section in `report.md` so you can see exactly what changed
+- **apply/approve workflow**: `/evolve apply [runDir]` copies the best candidate to the original target with diff preview and explicit confirmation
+- **artifact-type rubric presets**: the judge uses type-specific scoring guidance (`skill` / `prompt` / `instructions`) in both TypeScript and Python backends
 
 ## Development
 
@@ -329,9 +338,6 @@ Use `--telemetry-export otlp-http --otlp-endpoint http://host:4318` to ship trac
 ## Next useful upgrades
 
 - add real execution-based evaluation via subagent runs
-- add prompt-template / skill-specific rubric presets
-- add diff rendering in the final report
-- add apply/approve workflows behind explicit confirmation
 - add automatic browser/game automation for benchmark runs instead of scaffold-only preparation
 - add benchmark/test gates to the Python backend so GEPA mutations are filtered by real task outcomes
 - add repeated multi-run aggregation across several held-out boards instead of single-run summaries

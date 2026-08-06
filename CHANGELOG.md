@@ -71,6 +71,12 @@ The TypeScript engine is now the source-of-truth implementation of the Hermes Ph
 - refactor `scripts/smoke-test.ts` to consume the new hooks; remove the global `Math.random` monkey-patch and synthetic `gate.json` writes that were previously documented as Known Limitations in `tests/smoke-test-report.md`
 - remove the two `// SOFT-SPOT(coherence-default)` and `// SOFT-SPOT(cohort-default)` comments at the `runTieredGate` call site; the corresponding entries in `tests/smoke-test-report.md` Known Limitations are removed
 
+### Hermes parity gap closure
+
+- **diff rendering**: every evolution run now writes a `diff.patch` file (original body → best candidate body) and embeds a `## Diff` section in `report.md`
+- **apply/approve workflow**: new `/evolve apply [runDir]` command copies the best candidate to the target file after showing the diff and requiring explicit `"yes"` confirmation; uses the last session run when no `runDir` is provided
+- **artifact-type rubric presets**: the judge now receives type-specific scoring guidance (`skill` / `prompt` / `instructions`) so correctness, procedure-following, and conciseness are weighted appropriately for each artifact kind; parity added in both TypeScript and Python backends
+
 ### Earlier Unreleased work
 
 - add `scripts/ralph_otel.py`, a traced Ralph loop for Hermes-parity gap closure work in this repo

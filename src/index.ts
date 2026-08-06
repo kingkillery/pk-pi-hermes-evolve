@@ -5,7 +5,7 @@ import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@m
 import { getMarkdownTheme } from "@mariozechner/pi-coding-agent";
 import { Markdown, Text } from "@mariozechner/pi-tui";
 import { Type, type Static } from "@sinclair/typebox";
-import { runEvolution, type EvolutionSummaryDetails } from "./engine.js";
+import { applyBestCandidate, computeUnifiedDiff, loadApplyManifest, runEvolution, type EvolutionSummaryDetails } from "./engine.js";
 import type { EvalSource, EvolutionOptions } from "./types.js";
 
 const DEFAULT_OBJECTIVE = "Improve trigger clarity, execution quality, and practical usefulness while preserving the artifact's intent.";
@@ -174,12 +174,86 @@ function buildSummaryMarkdown(details: EvolutionSummaryDetails): string {
 function usageText(cwd: string): string {
   return [
     "Usage:",
-    "- /evolve                → interactive picker",
-    "- /evolve path/to/file   → evolve a specific artifact",
-    "- /evolve last           → show the last report saved in this session",
+    "- /evolve                      → interactive picker",
+    "- /evolve path/to/file         → evolve a specific artifact",
+    "- /evolve last                 → show the last report saved in this session",
+    "- /evolve apply                → apply the best candidate from the last run",
+    "- /evolve apply <runDir>       → apply the best candidate from a specific run directory",
     "",
     `Artifacts are discovered under ${cwd} (.pi/skills, .pi/prompts, AGENTS.md, SYSTEM.md, etc.).`,
   ].join("\n");
+}
+
+async function handleApplyCommand(runDirArg: string | undefined, ctx: ExtensionCommandContext, pi: ExtensionAPI): Promise<void> {
+  let runDir = runDirArg?.trim() || "";
+  if (!runDir) {
+    const last = getLastRun(ctx);
+    if (!last?.runDir) {
+      ctx.ui.notify("No self-evolution run found in this session. Provide a run directory: /evolve apply .pi/hermes-self-evolution/runs/<run>", "warning");
+      return;
+    }
+    runDir = last.runDir;
+  }
+  const resolvedRunDir = path.isAbsolute(runDir) ? runDir : path.resolve(ctx.cwd, runDir);
+  const manifest = await loadApplyManifest(resolvedRunDir);
+  if (!manifest) {
+    ctx.ui.notify(`Could not read manifest.json from ${resolvedRunDir}. Run directory may be invalid.`, "error");
+    return;
+  }
+
+  const targetPath = manifest.targetPath;
+  const candidateName = manifest.bestCandidateName || manifest.bestCandidate?.name || "best-candidate";
+  const improvement = manifest.improvement ?? 0;
+  const sign = improvement >= 0 ? "+" : "";
+  const bestCandidatePath = path.join(resolvedRunDir, "best-candidate.md");
+  const originalPath = path.join(resolvedRunDir, "original.md");
+
+  let diff = "";
+  try {
+    const [origContent, candContent] = await Promise.all([
+      fs.promises.readFile(originalPath, "utf8").catch(() => ""),
+      fs.promises.readFile(bestCandidatePath, "utf8").catch(() => ""),
+    ]);
+    if (origContent && candContent) {
+      diff = computeUnifiedDiff(path.basename(targetPath), origContent, candContent);
+    }
+  } catch { /* diff preview unavailable */ }
+
+  const preview = [
+    `Target:    ${targetPath}`,
+    `Candidate: ${candidateName}`,
+    `Holdout improvement: ${sign}${improvement.toFixed(3)}`,
+    "",
+    "This will OVERWRITE the target file with the best candidate.",
+    "The original is preserved in:",
+    `  ${originalPath}`,
+    "",
+    diff ? `Diff preview (first 60 lines):\n${diff.split("\n").slice(0, 60).join("\n")}` : "",
+  ].filter(Boolean).join("\n");
+
+  ctx.ui.notify(preview, "info");
+  if (!ctx.hasUI) {
+    ctx.ui.notify("Interactive UI unavailable. Use the tool parameter createPR or apply manually.", "warning");
+    return;
+  }
+  const confirm = await ctx.ui.input(`Type "yes" to apply "${candidateName}" to ${path.basename(targetPath)}`, "");
+  if (confirm?.trim().toLowerCase() !== "yes") {
+    ctx.ui.notify("Apply cancelled.", "info");
+    return;
+  }
+  try {
+    const result = await applyBestCandidate(resolvedRunDir);
+    ctx.ui.notify(`Applied "${result.candidateName}" → ${result.targetPath}`, "info");
+    pi.sendMessage({
+      customType: "hermes-self-evolution",
+      content: `## Applied best candidate\n\n- **Target:** ${result.targetPath}\n- **Candidate:** ${result.candidateName}\n- **Holdout improvement:** ${sign}${result.improvement.toFixed(3)}\n\nThe file has been updated. Review and commit when satisfied.`,
+      display: true,
+      details: { targetPath: result.targetPath, candidateName: result.candidateName, improvement: result.improvement },
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    ctx.ui.notify(`Apply failed: ${message}`, "error");
+  }
 }
 
 async function chooseArtifactInteractively(ctx: ExtensionCommandContext): Promise<string | null> {
@@ -286,6 +360,13 @@ export default function hermesSelfEvolutionExtension(pi: ExtensionAPI): void {
   pi.registerCommand("evolve", {
     description: "Run a Hermes-style self-evolution loop for a local skill, prompt, or instruction file",
     handler: async (args, ctx) => {
+      const trimmedArgs = args.trim();
+      if (trimmedArgs === "apply" || trimmedArgs.startsWith("apply ")) {
+        const runDirArg = trimmedArgs.slice("apply".length).trim() || undefined;
+        await handleApplyCommand(runDirArg, ctx, pi);
+        return;
+      }
+
       const options = await resolveCommandOptions(args, ctx);
       if (!options) return;
 
