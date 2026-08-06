@@ -26,6 +26,11 @@ function slugFromPath(artifactPath: string): { basename: string; slug: string } 
   return { basename, slug };
 }
 
+function normalizeArtifactPath(cwd: string, artifactPath: string): string {
+  const absolute = path.isAbsolute(artifactPath) ? artifactPath : path.join(cwd, artifactPath);
+  return path.normalize(path.relative(cwd, absolute));
+}
+
 export async function appendLineageEntry(cwd: string, entry: LineageEntry): Promise<void> {
   const file = lineagePath(cwd);
   await fs.mkdir(path.dirname(file), { recursive: true });
@@ -55,9 +60,11 @@ export async function loadLineage(cwd: string): Promise<LineageEntry[]> {
  * Callers usually know an artifact's path before its new content is materialized, so:
  *   - If `artifactContent` is supplied, hash it and return the highest-score entry whose
  *     `artifactHash` matches exactly. This is the precise lookup.
- *   - If only `artifactPath` is supplied, fall back to a path-locality heuristic: select
- *     entries whose `runId` contains the artifact basename (engine convention) and return
- *     the highest-score entry from that subset.
+ *   - If only `artifactPath` is supplied, prefer an exact normalized path match against the
+ *     stored lineage `artifactPath`. This avoids cross-artifact false positives when multiple
+ *     files share the same basename.
+ *   - For legacy lineage entries that predate `artifactPath`, fall back to the previous
+ *     basename/slug heuristic only when *no* entry in the lineage has path metadata.
  *   - When neither an exact content hash match nor a runId-substring match exists, return
  *     `null` rather than falling back to the global-highest-score entry. This prevents
  *     false-positive ancestor lookups for unknown paths. See Lane D smoke findings.
@@ -77,6 +84,21 @@ export async function loadBestAncestor(
     return pickHighestScore(matches);
   }
 
+  const normalizedTargetPath = normalizeArtifactPath(cwd, artifactPath);
+  const entriesWithArtifactPath = entries.flatMap((entry) => {
+    if (!entry.artifactPath) return [];
+    return [{ entry, normalizedArtifactPath: normalizeArtifactPath(cwd, entry.artifactPath) }];
+  });
+  const byArtifactPath = entriesWithArtifactPath
+    .filter(({ normalizedArtifactPath }) => normalizedArtifactPath === normalizedTargetPath)
+    .map(({ entry }) => entry);
+  if (byArtifactPath.length > 0) return pickHighestScore(byArtifactPath);
+
+  // Once any lineage entry records its source path, avoid falling back to basename/slug
+  // matching for a path miss; mixing the old heuristic with exact path metadata would
+  // reintroduce the same false positives this lookup is trying to eliminate.
+  if (entriesWithArtifactPath.length > 0) return null;
+
   const { basename, slug } = slugFromPath(artifactPath);
   const byRunId = entries.filter((e) => e.runId.includes(basename) || (slug.length > 0 && e.runId.includes(slug)));
   if (byRunId.length === 0) return null;
@@ -89,4 +111,24 @@ function pickHighestScore(entries: LineageEntry[]): LineageEntry {
     if (entries[i]!.score > best.score) best = entries[i]!;
   }
   return best;
+}
+
+const RUNS_REL_PATH = path.join(".pi", "hermes-self-evolution", "runs");
+
+/**
+ * Loads and hash-verifies the winning artifact body from an ancestor run's `best-candidate.md`
+ * (`runDir = .pi/hermes-self-evolution/runs/<entry.runId>`, written by the engine alongside the
+ * lineage entry). Returns null if the run directory or file is missing, or if the file's content
+ * hash no longer matches `entry.artifactHash` — a human edit, a pruned run, or a mismatched
+ * lineage.jsonl would otherwise let an unverified body silently become a mutation parent.
+ */
+export async function resolveAncestorBody(cwd: string, entry: LineageEntry): Promise<string | null> {
+  const candidatePath = path.join(cwd, RUNS_REL_PATH, entry.runId, "best-candidate.md");
+  let body: string;
+  try {
+    body = await fs.readFile(candidatePath, "utf8");
+  } catch {
+    return null;
+  }
+  return hashContent(body) === entry.artifactHash ? body : null;
 }

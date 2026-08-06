@@ -55,6 +55,13 @@ export interface AggregateScore {
 export interface ArtifactEvaluation {
   aggregate: AggregateScore;
   examples: ExampleEvaluation[];
+  /**
+   * Number of examples in this evaluation whose real-executor run failed (spawn error, non-zero
+   * exit, or timeout, after one retry) when `useRealExecutor` was requested. Any value > 0 means
+   * the aggregate mixes executor-grounded and judge-estimated observations, so the evaluation
+   * must not be used to accept a candidate or justify promotion (fail closed).
+   */
+  executorFailureCount?: number;
 }
 
 export interface CandidateDraft {
@@ -79,6 +86,13 @@ export interface ExecutionTrace {
   feedback: string;
   isFailure: boolean;
   timestamp: string;
+  /**
+   * True when `rawOutput` is a real `pi` executor stdout transcript (the artifact was actually
+   * run) rather than the judge's own JSON response. Reflection prompts use this to decide
+   * whether `rawOutput` is safe to show the mutator as "what the agent did" — judge JSON
+   * presented as observed behavior would mislead the mutation, not inform it.
+   */
+  hasRealExecution?: boolean;
 }
 
 export type ConstraintName =
@@ -115,9 +129,21 @@ export interface PRAutomationResult {
   diffStat: string;
 }
 
+export interface SecretSpan {
+  start: number;
+  end: number;
+  ruleId: string;
+}
+
 export interface SecretScanResult {
   found: boolean;
+  /**
+   * Human-readable findings. `match` never contains secret material — only the rule id and the
+   * character span. Redaction operates on `spans`, not on these labels.
+   */
   patterns: Array<{ pattern: string; match: string; location: string }>;
+  /** Exact character spans of every match, for span-based redaction. */
+  spans: SecretSpan[];
 }
 
 export interface GoldenDatasetManifest {
@@ -144,12 +170,22 @@ export interface CandidateRecord extends CandidateDraft {
   executionObservation?: ExecutionObservation;
   gateResults?: TieredGateResult[];
   /**
-   * True when this candidate was promoted by the engine's fallback acceptance
-   * path because no iteration met the strict score-delta + constraints gate.
-   * Surfaced in manifest.json#bestCandidate so downstream tools can detect
-   * degenerate "winner" promotion without spelunking `warnings`.
+   * True when no iteration passed every hard gate this run and the engine retained the baseline
+   * artifact unchanged as the "winner". A gate-failing draft is never promoted — the only
+   * fallback outcome is the baseline itself. Surfaced in manifest.json#bestCandidate so
+   * downstream tools can detect a no-safe-improvement run without spelunking `warnings`.
    */
   wasFallbackPromoted?: boolean;
+  /**
+   * Names of the pool member(s) this candidate was derived from: one entry for a mutation,
+   * two for a merge (in `a, b` order as passed to `generateMergeCandidateDraft`). Undefined
+   * for the baseline itself.
+   */
+  parentCandidates?: string[];
+  /** How this candidate's draft was produced: reflective mutation of a Pareto-selected parent, or a merge of two frontier candidates. */
+  selectionMethod?: "mutation" | "merge";
+  /** Composite judge score on the cheap train-set minibatch, used as the pre-filter gate before a full validation pass. */
+  minibatchScore?: number;
 }
 
 export interface EvolutionOptions {
@@ -171,10 +207,14 @@ export interface EvolutionOptions {
   seed?: number;
   /** Cohort of EvalExamples used by the tiered gate's cohort-regression tier. */
   cohortExamples?: EvalExample[];
-  /** Judge callback invoked by the tiered gate to score the cohort. Required when cohortExamples is supplied. */
-  cohortJudgeFunc?: (examples: EvalExample[]) => Promise<{ composite: number }>;
-  /** Coherence check callback invoked by the tiered gate's coherence tier. */
-  coherenceCheck?: () => Promise<{ passed: boolean; detail: string }>;
+  /**
+   * Judge callback invoked by the tiered gate to score an artifact text on the cohort. The gate
+   * calls it for both the baseline and each candidate on the SAME cohort, so the regression
+   * delta is a paired comparison. Required when cohortExamples is supplied.
+   */
+  cohortJudgeFunc?: (artifactText: string, examples: EvalExample[]) => Promise<{ composite: number }>;
+  /** Coherence check callback invoked by the tiered gate's coherence tier with the candidate text under evaluation. */
+  coherenceCheck?: (candidateText: string) => Promise<{ passed: boolean; detail: string }>;
   /** Override the tsconfig path the tiered-gate typecheck tier runs against. Useful for forcing typecheck-tier failure in test scenarios. */
   tsConfigPath?: string;
 }
@@ -217,6 +257,12 @@ export interface EvolutionRunResult {
   baselineTraces: ExecutionTrace[];
   prResult?: PRAutomationResult;
   iterations?: IterationRecord[];
+  /** Names of the final Pareto-frontier candidates (best-on-at-least-one-validation-instance), for reporting. */
+  paretoFrontier?: string[];
+  /** Number of system-aware merge candidates attempted during this run. */
+  mergeAttempts?: number;
+  /** Number of iterations rejected by the minibatch pre-filter before reaching a full validation pass. */
+  minibatchFilteredCount?: number;
 }
 
 export interface ReflectionPrompt {
@@ -228,7 +274,10 @@ export interface ReflectionPrompt {
 
 export interface IterationRecord {
   iteration: number;
+  /** Primary parent's pool name (the mutation parent, or the first merge input). Kept for backward compatibility; see `parentCandidates` for the full lineage. */
   parentCandidate?: string;
+  /** Full lineage: one entry for a mutation, two (`a`, `b`) for a merge. */
+  parentCandidates?: string[];
   mutationRationale: string;
   reflectionPrompt: ReflectionPrompt;
   candidate: CandidateDraft;
@@ -237,6 +286,18 @@ export interface IterationRecord {
   scoreDelta: number;
   accepted: boolean;
   gateResults?: TieredGateResult[];
+  /** How the draft evaluated in this iteration was produced. */
+  selectionMethod?: "mutation" | "merge";
+  /** Size of the Pareto frontier at selection time: the mutation-parent sampling pool for a mutation, or the frontier a merge's two inputs were drawn from. */
+  paretoFrontierSize?: number;
+  /**
+   * True when the candidate was rejected by the cheap minibatch pre-filter
+   * (composite on a small train subset did not beat its parent) and therefore
+   * never went through the expensive full-validation + real-executor pass.
+   * When true, `evaluation`/`traces` hold the minibatch-only results, not a
+   * validation-set evaluation.
+   */
+  minibatchFiltered?: boolean;
 }
 
 export interface ExecutionObservation {
@@ -247,17 +308,27 @@ export interface ExecutionObservation {
   capturedFiles?: Record<string, string>;
 }
 
+export type GateStatus = "pass" | "fail" | "unknown";
+
 export interface TieredGateResult {
   tier: "typecheck" | "cohort" | "coherence";
   passed: boolean;
   reasonCode: string;
   detail: string;
   durationMs: number;
+  /**
+   * Tri-state outcome distinguishing a genuine verdict from evaluator uncertainty: "pass"/"fail"
+   * are real measurements; "unknown" means the tier itself errored (judge outage, callback threw)
+   * and the candidate is blocked without being scored — never mapped to a plausible number.
+   * Absent on results written before this field existed; treat those as pass/fail per `passed`.
+   */
+  status?: GateStatus;
 }
 
 export interface LineageEntry {
   runId: string;
   parentRunId?: string;
+  artifactPath?: string;
   artifactHash: string;
   parentArtifactHash?: string;
   score: number;

@@ -9,6 +9,7 @@ import * as types from "../src/types.js";
 
 const EXPECTED_ENGINE_EXPORTS = [
   "scanForSecrets",
+  "redactSecrets",
   "resolveArtifactTarget",
   "loadGoldenDataset",
   "runEvolution",

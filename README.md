@@ -230,7 +230,9 @@ The TypeScript engine implements the Hermes Phase 1 workflow end-to-end. Status 
 | Secret scanner on datasets | ✅ | `scanForSecrets` in `src/engine.ts` |
 | Optional test-command gate | ✅ | `runTestCommand` in `src/engine.ts` |
 | Optional PR automation (branch + `gh pr create`) | ✅ | `createGitBranchWithCandidate` |
-| **Iterative reflective loop** (GEPA-shape) | ✅ | iteration loop in `runTypeScriptEvolution`; `IterationRecord[]` in `iterations/` |
+| **Iterative reflective loop** (GEPA-Pareto: frontier-based parent selection, minibatch pre-filter, bounded system-aware merge) | ✅ | iteration loop in `runTypeScriptEvolution`; `IterationRecord[]` in `iterations/` |
+| **Pareto-frontier candidate pool** (illumination-style parent sampling instead of greedy hill-climbing; mutation edits the selected parent's own body) | ✅ | `computeParetoFrontier` / `selectParetoParent` in `src/engine.ts` |
+| **System-aware merge** (bounded crossover of two frontier candidates' complementary strengths) | ✅ | `generateMergeCandidateDraft` in `src/engine.ts` |
 | **Pi-native executor** (real stdout, not predicted) | ✅ | `src/pi-executor.ts` → `executeCandidateInPi` |
 | **Tiered regression gate** (typecheck → cohort → coherence) | ✅ | `src/tiered-gate.ts` → `runTieredGate` |
 | **SKILL.md structural validator** (name + description in first 500 chars) | ✅ | `src/constraints-structure.ts` |
@@ -247,6 +249,12 @@ What is still out of scope versus the full Nous vision:
 - no built-in pytest gate (use `testCommand` to wire one)
 
 This package implements **Hermes Phase 1 in TypeScript** as a first-class pi extension.
+
+Parity gap closures layered on top of Phase 1:
+
+- **diff rendering**: every run writes `diff.patch` and embeds a `## Diff` section in `report.md` so you can see exactly what changed
+- **apply/approve workflow**: `/evolve apply [runDir]` copies the best candidate to the original target with diff preview and explicit confirmation
+- **artifact-type rubric presets**: the judge uses type-specific scoring guidance (`skill` / `prompt` / `instructions`) in both TypeScript and Python backends
 
 ## Development
 
