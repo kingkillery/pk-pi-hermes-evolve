@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 - 2026-08-08
 
 ### Evaluation-architecture correctness fixes
 
