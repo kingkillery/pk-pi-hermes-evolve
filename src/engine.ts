@@ -1,8 +1,10 @@
 import { spawn } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { withFileMutationQueue } from "@mariozechner/pi-coding-agent";
 import { detectPythonBackend, runPythonBackend } from "./python-backend.js";
 import { mineSessionSnippets } from "./session-history.js";
@@ -59,28 +61,16 @@ const DRIFT_SYSTEM_PROMPT = `You compare two versions of an instruction artifact
 A lower drift score means the evolved version preserves the original meaning.
 Return strict JSON only. Do not include markdown fences.`;
 
-const SECRET_PATTERNS: Array<{ name: string; pattern: RegExp }> = [
-  { name: "anthropic-key", pattern: /\bsk-ant-api\S{10,}\b/ },
-  { name: "openrouter-key", pattern: /\bsk-or-v1-\S{10,}\b/ },
-  { name: "openai-key", pattern: /\bsk-\S{20,}\b/ },
-  { name: "github-token", pattern: /\bghp_\S{10,}\b/ },
-  { name: "github-user-token", pattern: /\bghu_\S{10,}\b/ },
-  { name: "slack-bot-token", pattern: /\bxoxb-\S{10,}\b/ },
-  { name: "slack-app-token", pattern: /\bxapp-\S{10,}\b/ },
-  { name: "notion-token", pattern: /\bntn_\S{10,}\b/ },
-  { name: "aws-key", pattern: /\bAKIA[0-9A-Z]{16}\b/ },
-  { name: "bearer-auth", pattern: /\bBearer\s+\S{20,}\b/ },
-  { name: "private-key", pattern: /-----BEGIN\s+(?:RSA\s+)?PRIVATE\sKEY-----/ },
-  { name: "env-anthropic", pattern: /\bANTHROPIC_API_KEY\b/ },
-  { name: "env-openai", pattern: /\bOPENAI_API_KEY\b/ },
-  { name: "env-openrouter", pattern: /\bOPENROUTER_API_KEY\b/ },
-  { name: "env-github", pattern: /\bGITHUB_TOKEN\b/ },
-  { name: "env-aws-secret", pattern: /\bAWS_SECRET_ACCESS_KEY\b/ },
-  { name: "env-database", pattern: /\bDATABASE_URL\b/ },
-  { name: "password-assignment", pattern: /\bpassword\s*[=:]\s*\S{6,}\b/ },
-  { name: "secret-assignment", pattern: /\bsecret\s*[=:]\s*\S{6,}\b/ },
-  { name: "token-assignment", pattern: /\btoken\s*[=:]\s*\S{10,}\b/ },
-];
+const SECRET_PATTERNS: Array<{ name: string; pattern: RegExp }> = (() => {
+  // Load the canonical pattern list from src/secret-patterns.json so the TypeScript engine
+  // and the Python backend (which reads the same file) can never drift out of parity.
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const jsonPath = path.join(here, "secret-patterns.json");
+  const parsed = JSON.parse(readFileSync(jsonPath, "utf8")) as {
+    patterns: Array<{ name: string; pattern: string }>;
+  };
+  return parsed.patterns.map(({ name, pattern }) => ({ name, pattern: new RegExp(pattern) }));
+})();
 
 export function scanForSecrets(text: string): SecretScanResult {
   const found: SecretScanResult["patterns"] = [];

@@ -261,7 +261,7 @@ Parity gap closures layered on top of Phase 1:
 Install dev dependencies and type-check:
 
 ```bash
-cd /c/dev/Desktop-Projects/pi-hermes-self-evolution
+# from the repository root
 npm install
 npm run typecheck
 npm run python:check
@@ -316,7 +316,7 @@ python scripts/sokoban_benchmark.py analyze \
 The repo now includes a traced Ralph loop for closing the highest-value Hermes parity gaps:
 
 ```bash
-cd /c/dev/Desktop-Projects/pi-hermes-self-evolution
+# from the repository root
 python scripts/ralph_otel.py \
   --task-file scripts/tasks/hermes_parity_task.json \
   --repo . \

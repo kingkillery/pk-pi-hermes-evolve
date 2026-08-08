@@ -5,6 +5,12 @@ import path from "node:path";
 import type { ExecutionObservation } from "./types.js";
 
 const DEFAULT_TIMEOUT_MS = 120_000;
+// Cap in-memory buffered subprocess output. A misbehaving candidate can emit
+// unbounded stdout/stderr for up to `timeoutMs`, so we hard-limit each stream
+// to 2 MiB and mark truncation in the returned observation instead of letting
+// the process grow to arbitrary memory.
+const DEFAULT_STREAM_LIMIT_BYTES = 2 * 1024 * 1024;
+const TRUNCATION_MARKER = "\n[...truncated...]";
 
 function getPiInvocation(args: string[]): { command: string; args: string[] } {
   const currentScript = process.argv[1];
@@ -34,7 +40,44 @@ export interface ExecuteCandidateOptions {
   model?: string;
   thinkingLevel?: string;
   timeoutMs?: number;
+  /** Max bytes retained per stdout/stderr stream; excess is dropped and marked. */
+  streamLimitBytes?: number;
   signal?: AbortSignal;
+}
+
+/**
+ * Accumulates bytes from a child process stream up to a cap. Once the cap is
+ * exceeded further chunks are discarded (a single truncation marker is
+ * appended once) so the parent process cannot be pushed OOM by a runaway
+ * candidate. Returns the retained bytes as a UTF-8 string plus a truncation
+ * flag consumers can surface.
+ */
+class BoundedStreamBuffer {
+  private chunks: Buffer[] = [];
+  private size = 0;
+  private truncated = false;
+  private readonly limit: number;
+  constructor(limit: number) {
+    this.limit = limit;
+  }
+  append(chunk: Buffer): void {
+    if (this.truncated) return;
+    const remaining = this.limit - this.size;
+    if (chunk.length <= remaining) {
+      this.chunks.push(chunk);
+      this.size += chunk.length;
+      return;
+    }
+    if (remaining > 0) {
+      this.chunks.push(chunk.subarray(0, remaining));
+      this.size += remaining;
+    }
+    this.truncated = true;
+  }
+  toString(): string {
+    const text = Buffer.concat(this.chunks, this.size).toString("utf8");
+    return this.truncated ? `${text}${TRUNCATION_MARKER}` : text;
+  }
 }
 
 /**
@@ -83,11 +126,12 @@ export async function executeCandidateInPi(options: ExecuteCandidateOptions): Pr
 
   const invocation = getPiInvocation(args);
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const streamLimit = options.streamLimitBytes ?? DEFAULT_STREAM_LIMIT_BYTES;
   const startedAt = Date.now();
 
   const observation = await new Promise<ExecutionObservation>((resolve) => {
-    let stdout = "";
-    let stderr = "";
+    const stdoutBuf = new BoundedStreamBuffer(streamLimit);
+    const stderrBuf = new BoundedStreamBuffer(streamLimit);
     let settled = false;
     const child = spawn(invocation.command, invocation.args, {
       cwd: options.cwd,
@@ -104,9 +148,10 @@ export async function executeCandidateInPi(options: ExecuteCandidateOptions): Pr
       settled = true;
       clearTimeout(timer);
       options.signal?.removeEventListener("abort", onAbort);
+      const stderrText = stderrBuf.toString();
       resolve({
-        stdout: stdout.trim(),
-        stderr: (extraStderr ? `${stderr}\n${extraStderr}` : stderr).trim(),
+        stdout: stdoutBuf.toString().trim(),
+        stderr: (extraStderr ? `${stderrText}\n${extraStderr}` : stderrText).trim(),
         exitCode,
         durationMs,
       });
@@ -132,10 +177,10 @@ export async function executeCandidateInPi(options: ExecuteCandidateOptions): Pr
     options.signal?.addEventListener("abort", onAbort, { once: true });
 
     child.stdout.on("data", (chunk: Buffer) => {
-      stdout += String(chunk);
+      stdoutBuf.append(chunk);
     });
     child.stderr.on("data", (chunk: Buffer) => {
-      stderr += String(chunk);
+      stderrBuf.append(chunk);
     });
     child.on("error", (err: Error) => {
       finish(-1, Date.now() - startedAt, err.message);

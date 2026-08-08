@@ -31,3 +31,67 @@ jobs:
 
       - name: Validate Python backend syntax
         run: npm run python:check
+
+      - name: Install Python test deps
+        run: python -m pip install --upgrade pip pytest
+
+      - name: Python backend tests
+        run: npm run python:test
+
+      - name: Parity gate
+        run: npm run test:parity
+
+      - name: Smoke tests
+        run: npm run test:smoke
+
+  audit:
+    runs-on: ubuntu-latest
+    # Non-blocking: surface known-vulnerable production deps without failing PRs.
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install Node deps
+        run: npm ci
+
+      - name: npm audit (production)
+        run: npm audit --omit=dev --audit-level=high
+
+  lint:
+    runs-on: ubuntu-latest
+    # Non-blocking during rollout: report Biome/Ruff findings without failing
+    # existing PRs. Flip continue-on-error to false once the codebase is clean.
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Node deps
+        run: npm ci
+
+      - name: Install Ruff
+        run: python -m pip install --upgrade pip ruff
+
+      - name: Biome (TypeScript/JavaScript)
+        run: npm run lint
+
+      - name: Ruff (Python)
+        run: npm run lint:py

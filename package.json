@@ -43,7 +43,11 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "python:check": "python -m py_compile python_backend/run_backend.py python_backend/pk_pi_hermes_evolve/backend.py scripts/ralph_otel.py scripts/sokoban_benchmark.py",
+    "lint": "npx --yes @biomejs/biome@1.9.4 check src tests scripts",
+    "lint:fix": "npx --yes @biomejs/biome@1.9.4 check --write src tests scripts",
+    "lint:py": "python -m ruff check python_backend scripts",
+    "python:check": "python -m compileall -q python_backend scripts",
+    "python:test": "python -m pytest python_backend/tests -q",
     "ralph:parity": "python scripts/ralph_otel.py --task-file scripts/tasks/hermes_parity_task.json --repo . --telemetry-export console",
     "benchmark:sokoban:help": "python scripts/sokoban_benchmark.py --help",
     "test:parity": "node --experimental-strip-types -e \"import('./tests/parity.test.ts').then(m => { const r = m.runParityGate(); console.log('parity:', JSON.stringify(r)); }).catch(e => { console.error('FAIL:', e.message); process.exit(1); })\"",

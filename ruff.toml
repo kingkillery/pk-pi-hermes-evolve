@@ -1,0 +1,32 @@
+# Ruff config for the Python backend and helper scripts.
+# Keep the ruleset conservative so it can be adopted incrementally without a
+# large one-time cleanup PR.
+
+target-version = "py310"
+line-length = 120
+
+extend-exclude = [
+  ".pi",
+  "node_modules",
+  "python_backend/build",
+]
+
+[lint]
+# Start with the common defaults plus a few high-value rule sets. Fine-tune
+# per-file with `# noqa: <code>` when necessary.
+select = [
+  "E",    # pycodestyle errors
+  "F",    # pyflakes
+  "I",    # isort
+  "B",    # bugbear
+  "UP",   # pyupgrade
+  "W",    # pycodestyle warnings
+]
+ignore = [
+  # Long lines are common in embedded prompts and rubric strings; enforce via
+  # line-length only, not E501 hard rejection.
+  "E501",
+]
+
+[lint.per-file-ignores]
+"python_backend/tests/**" = ["B", "E402"]

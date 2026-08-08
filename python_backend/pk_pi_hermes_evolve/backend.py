@@ -19,25 +19,70 @@ except Exception:  # pragma: no cover - handled by doctor/run path
 
 
 # ── Secret detection (P1) ──
+#
+# The canonical pattern list lives in src/secret-patterns.json (relative to the
+# repo root) so this Python backend and the TypeScript engine (src/engine.ts)
+# always scan for the same set of secrets. If the shared file cannot be located
+# at runtime (for example when the sidecar is installed without the TS sources),
+# we fall back to a built-in list that mirrors the shipped JSON.
 
-SECRET_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
-    ("anthropic-key", re.compile(r"\bsk-ant-api\S{10,}\b")),
-    ("openrouter-key", re.compile(r"\bsk-or-v1-\S{10,}\b")),
-    ("openai-key", re.compile(r"\bsk-\S{20,}\b")),
-    ("github-token", re.compile(r"\bghp_\S{10,}\b")),
-    ("slack-bot-token", re.compile(r"\bxoxb-\S{10,}\b")),
-    ("bearer-auth", re.compile(r"\bBearer\s+\S{20,}\b")),
-    ("private-key", re.compile(r"-----BEGIN\s+(?:RSA\s+)?PRIVATE\sKEY-----")),
-    ("env-anthropic", re.compile(r"\bANTHROPIC_API_KEY\b")),
-    ("env-openai", re.compile(r"\bOPENAI_API_KEY\b")),
-    ("env-openrouter", re.compile(r"\bOPENROUTER_API_KEY\b")),
-    ("env-github", re.compile(r"\bGITHUB_TOKEN\b")),
-    ("env-aws", re.compile(r"\bAWS_SECRET_ACCESS_KEY\b")),
-    ("env-database", re.compile(r"\bDATABASE_URL\b")),
-    ("password", re.compile(r"\bpassword\s*[=:]\s*\S{6,}\b")),
-    ("secret", re.compile(r"\bsecret\s*[=:]\s*\S{6,}\b")),
-    ("token", re.compile(r"\btoken\s*[=:]\s*\S{10,}\b")),
+_FALLBACK_SECRET_PATTERNS: list[tuple[str, str]] = [
+    ("anthropic-key", r"\bsk-ant-api\S{10,}\b"),
+    ("openrouter-key", r"\bsk-or-v1-\S{10,}\b"),
+    ("openai-key", r"\bsk-\S{20,}\b"),
+    ("github-token", r"\bghp_\S{10,}\b"),
+    ("github-user-token", r"\bghu_\S{10,}\b"),
+    ("slack-bot-token", r"\bxoxb-\S{10,}\b"),
+    ("slack-app-token", r"\bxapp-\S{10,}\b"),
+    ("notion-token", r"\bntn_\S{10,}\b"),
+    ("aws-key", r"\bAKIA[0-9A-Z]{16}\b"),
+    ("bearer-auth", r"\bBearer\s+\S{20,}\b"),
+    ("private-key", r"-----BEGIN\s+(?:RSA\s+)?PRIVATE\sKEY-----"),
+    ("env-anthropic", r"\bANTHROPIC_API_KEY\b"),
+    ("env-openai", r"\bOPENAI_API_KEY\b"),
+    ("env-openrouter", r"\bOPENROUTER_API_KEY\b"),
+    ("env-github", r"\bGITHUB_TOKEN\b"),
+    ("env-aws-secret", r"\bAWS_SECRET_ACCESS_KEY\b"),
+    ("env-database", r"\bDATABASE_URL\b"),
+    ("password-assignment", r"\bpassword\s*[=:]\s*\S{6,}\b"),
+    ("secret-assignment", r"\bsecret\s*[=:]\s*\S{6,}\b"),
+    ("token-assignment", r"\btoken\s*[=:]\s*\S{10,}\b"),
 ]
+
+
+def _find_shared_patterns_file() -> Path | None:
+    # Walk upward from this file looking for src/secret-patterns.json. This
+    # covers both an editable install inside the repo and a copy inside the
+    # `python_backend/` directory shipped alongside the TS sources.
+    here = Path(__file__).resolve()
+    for parent in [here.parent, *here.parents]:
+        candidate = parent / "src" / "secret-patterns.json"
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _load_secret_patterns() -> list[tuple[str, re.Pattern[str]]]:
+    shared = _find_shared_patterns_file()
+    if shared is not None:
+        try:
+            data = json.loads(shared.read_text(encoding="utf-8"))
+            entries = data.get("patterns", [])
+            compiled: list[tuple[str, re.Pattern[str]]] = []
+            for entry in entries:
+                name = entry["name"]
+                pattern = entry["pattern"]
+                compiled.append((name, re.compile(pattern)))
+            if compiled:
+                return compiled
+        except (OSError, ValueError, KeyError):
+            # Fall through to the built-in list on any parse/read failure so
+            # the sidecar keeps a functional (if potentially older) scanner.
+            pass
+    return [(name, re.compile(pattern)) for name, pattern in _FALLBACK_SECRET_PATTERNS]
+
+
+SECRET_PATTERNS: list[tuple[str, re.Pattern[str]]] = _load_secret_patterns()
 
 
 def scan_for_secrets(text: str) -> list[dict[str, str]]:

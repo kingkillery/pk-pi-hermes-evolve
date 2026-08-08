@@ -36,6 +36,20 @@ jobs:
           npm run python:check
           npm pack --dry-run
 
+      - name: Verify release tag matches package.json
+        if: github.event_name == 'release'
+        shell: bash
+        run: |
+          LOCAL_VERSION=$(node -p "require('./package.json').version")
+          # github.event.release.tag_name is the tag that triggered the release.
+          RELEASE_TAG="${{ github.event.release.tag_name }}"
+          # Accept both "v1.2.3" and "1.2.3" style tags.
+          NORMALIZED_TAG="${RELEASE_TAG#v}"
+          if [ "$LOCAL_VERSION" != "$NORMALIZED_TAG" ]; then
+            echo "::error::Release tag ($RELEASE_TAG -> $NORMALIZED_TAG) does not match package.json version ($LOCAL_VERSION)."
+            exit 1
+          fi
+
       - name: Check published version
         id: version
         shell: bash
@@ -49,6 +63,15 @@ jobs:
           else
             echo "already_published=false" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Fail if release event has no version bump
+        # A release event that ends up as a no-op almost always means the author
+        # forgot to bump package.json. Surface it as a job failure instead of
+        # silently skipping the publish step.
+        if: github.event_name == 'release' && steps.version.outputs.already_published == 'true'
+        run: |
+          echo "::error::Release event fired but package.json version (${{ steps.version.outputs.local }}) is already published on npm. Bump the version before creating a release."
+          exit 1
 
       - name: Publish to npm
         if: steps.version.outputs.already_published != 'true'
